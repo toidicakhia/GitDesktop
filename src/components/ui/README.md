@@ -133,6 +133,26 @@ grep -n '"anchor"' src/components/ui/combobox.tsx
 No match means the anchor delta is gone. That file carries the panel-portal
 delta too, so check both of its markers.
 
+## Edge 109 compatibility delta
+
+A fourth delta, unrelated to the three above. Chromium 109 — the last runtime
+that installs on Windows 7/8.1 — drops an unguarded `color-mix()` declaration
+outright, so the `secondary` variant used to lose its hover feedback there
+entirely.
+
+- **`button.tsx`** — the `secondary` variant's hover tint is the
+  `--secondary-hover` token (`src/App.css`, one value per theme: the same
+  secondary-mixed-5%-toward-foreground the old arbitrary `color-mix` hover
+  utility computed). A token works where the utility didn't because the build
+  down-levels custom-property colors, while a `color-mix()` wrapping `var()`s
+  survives to the browser untouched.
+
+Grep the file after regenerating it:
+
+```sh
+grep -n 'hover:bg-secondary-hover' src/components/ui/button.tsx
+```
+
 ## Check before re-applying
 
 If one of these has to be re-created, confirm it is still needed. Verify

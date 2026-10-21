@@ -1,5 +1,8 @@
-// Position is load-bearing: the transport must be installed before any other
-// module's evaluation can reach an invoke() — this import stays FIRST.
+// Position is load-bearing: the webview-compat polyfills must land before any
+// module can call a built-in Edge 109 lacks, and the transport must be installed
+// before any other module's evaluation can reach an invoke() — these two imports
+// stay first, compat before transport.
+import "@/lib/webview-compat";
 import "@/lib/transport/install-desktop";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { domAnimation, LazyMotion, MotionConfig } from "motion/react";

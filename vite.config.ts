@@ -135,6 +135,23 @@ export default defineConfig(async () => ({
     },
   },
 
+  // Compatibility floor: Edge/WebView2 109 (Chromium 109) — the last runtime
+  // that installs on Windows 7/8.1 — sits below Tailwind v4's modern baseline:
+  // oklch()/lab()/color-mix() need Chrome 111. Lightning CSS is Vite's built-in
+  // alternative to the esbuild CSS minifier and, unlike it, down-levels color
+  // functions: against the 109 target every oklch() value gains an sRGB
+  // fallback while its wide-gamut form stays behind `@supports (color: lab(0%
+  // 0 0))`. Chromium-only on purpose; every other engine has a newer floor.
+  // Minification is build-time only, so `vite dev` serves a 109 browser the raw
+  // values (dev-only cosmetic loss).
+  build: {
+    target: ["chrome109"],
+    cssTarget: ["chrome109"],
+    // `as const` pins the literal: the config's inferred return type widens
+    // bare string literals, and `cssMinify` has no widened form.
+    cssMinify: "lightningcss" as const,
+  },
+
   // Pre-bundle the Shiki diff highlighter and the grammar bundles it imports by
   // subpath, so the dev server resolves them up front (a subpath import added
   // after the server is running otherwise fails until a restart).
