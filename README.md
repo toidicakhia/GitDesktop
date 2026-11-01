@@ -141,11 +141,14 @@ one side, and Ctrl, or Cmd on macOS, adds to a selection), including
 committing or discarding only part of a brand-new (untracked) file. Partial
 staging is for UTF-8 text; other encodings stage and discard as a whole file.
 Stage or unstage a drag-made selection with `Ctrl`/`⌘`+`Shift`+`Enter`,
-without reaching for the button. Stage, unstage, or discard single files or a
-multi-selection from the context menu (staging and unstaging a selection sit
-in the command palette too); discarding a whole untracked file goes to the
-recycle bin. Commit with title + body, co-authors suggested from history,
-amend, undo, reset, and revert.
+without reaching for the button. Press `Space` on a focused file to stage or
+unstage it. Once the file you're viewing has nothing left to stage, whole or
+line by line, the next file in the list opens (the one above it, at the end of
+a section), and unstaging works the same way in Staged. Stage, unstage, or
+discard single files or a multi-selection from the context menu (staging and
+unstaging a selection sit in the command palette too); discarding a whole
+untracked file goes to the recycle bin. Commit with title + body, co-authors
+suggested from history, amend, undo, reset, and revert.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="site/src/assets/readme/lines-poster.webp">
@@ -196,9 +199,11 @@ default's name), and a PR badge.
   push a branch that's ahead of the remote it tracks (its own remote, not
   just `origin`) or publish an unpushed one, choosing the remote when
   there's more than one. Works even when the branch is checked out in
-  another worktree. The list stays open while it runs: the branch's row
-  shows the push's progress and destination, and you can keep switching
-  and browsing.
+  another worktree. A publish that would create the branch on the remote
+  asks first, naming the branch and its destination, and the list closes
+  for the prompt. Otherwise the list stays open while it runs: the
+  branch's row shows the push's progress and destination, and you can
+  keep switching and browsing.
 - **Start a branch from any base**: the new-branch dialog's *Base it on*
   picker is a searchable list of local and remote branches. Basing on a
   remote branch (e.g. `origin/epic/big-feature`) starts from the remote tip
@@ -271,20 +276,23 @@ Git releases older than 2.30, or when the branch has no reflog for the
 check to read). When a branch tracks a remote branch with a different
 name and Git would refuse a plain push, **Push** opens a menu to push to
 the tracked branch or publish under the branch's own name; there's no
-force push until the names match. When the *remote* itself was rewritten
-(a server-side rebase) and every local commit already landed there under
-new ids, the Pull menu offers a confirmed **Reset to _origin/…_** that
-lines the two up instead. Pulling with rebase pre-checks the upstream for
-a rewrite that would take commits of yours off the branch, names them, and
+force push until the names match. A push that would create a branch on a
+remote asks first, naming the branch and where it's going, with **Cancel**
+focused so a stray Enter backs out; a branch the remote already has (as of
+the last fetch) just pushes. When the *remote* itself was rewritten (a
+server-side rebase) and every local commit already landed there under new
+ids, the Pull menu offers a confirmed **Reset to _origin/…_** that lines
+the two up instead. Pulling with rebase pre-checks the upstream for a
+rewrite that would take commits of yours off the branch, names them, and
 asks whether to keep or drop them, recording a drop in **Operation
 history**. When a repo has an `upstream` remote, the Pull menu adds
-**Update from upstream**: one click fetches upstream and brings your
-branch up to date (fast-forward when it can, a merge commit when cleanly
-diverged, the conflict editor otherwise), for keeping a fork current.
-**Auto-fetch** (on by default) quietly runs a background `git fetch` on an
-interval while the window is focused, so the behind-count and incoming
-commits stay current without pressing Fetch; it never pulls or merges, and
-pushing and pulling stay manual.
+**Update from upstream**: one click fetches upstream and brings your branch
+up to date (fast-forward when it can, a merge commit when cleanly diverged,
+the conflict editor otherwise), for keeping a fork current. **Auto-fetch**
+(on by default) quietly runs a background `git fetch` on an interval while
+the window is focused, so the behind-count and incoming commits stay
+current without pressing Fetch; it never pulls or merges, and pushing and
+pulling stay manual.
 
 - **Conflict editor**: an in-progress merge, rebase, cherry-pick, or revert
   gets a conflict banner naming it, with gated Continue / Abort. Selecting
@@ -985,11 +993,13 @@ GitDesktop tells an **expired-or-revoked session** apart from
 never-signed-in, network blips, and a **GitHub API rate limit** (GitLab's
 too, when its CLI names the limit). An expired session gets a badge with
 one-click **Reconnect**; a rate limit gets its own badge, with the time
-access resumes when GitHub reports it and nothing to reconnect. It also
-**warns before a token lapses**: GitLab and GitHub PAT expiry, plus an
-optional Bitbucket **expiry date** you supply. For GitLab it nudges the
-**browser (OAuth)** option, whose sessions renew themselves instead of
-expiring.
+access resumes when GitHub reports it and nothing to reconnect. While a
+GitHub rate limit is in effect, GitDesktop doesn't send most of the requests
+the limit covers until it lifts, and most actions that need one say so.
+GitDesktop also **warns before a token lapses**: GitLab and GitHub PAT
+expiry, plus an optional Bitbucket **expiry date** you supply. For GitLab
+it nudges the **browser (OAuth)** option, whose sessions renew themselves
+instead of expiring.
 
 ### Coding agent sessions
 

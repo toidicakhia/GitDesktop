@@ -6,7 +6,7 @@ import {
 } from "@phosphor-icons/react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { DIALOG_SCROLL } from "@/components/dialog-scroll";
 import { DisabledReasonButton } from "@/components/disabled-reason-button";
@@ -80,6 +80,7 @@ import { promotionBlocksCheckout } from "@/lib/stores/worktree-removal";
 import { parseableDate } from "@/lib/time";
 import { toastError } from "@/lib/toast";
 import { useLatestRef } from "@/lib/use-latest-ref";
+import { useToastClearance } from "@/lib/use-toast-clearance";
 import { cn, PLACEHOLDER_FADE } from "@/lib/utils";
 import { CreateReleaseDialog } from "./CreateReleaseDialog";
 
@@ -279,7 +280,12 @@ export function TagDetailView({
   // Never over an open Create-release dialog, whose draft a skeleton would
   // unmount: a no-release (404) refetch drops the read back to pending, and a
   // query reset also zeroes `isFetched`.
-  if (release.isLoading && !release.isFetched && !createReleaseOpen) {
+  const showsSkeleton =
+    release.isLoading && !release.isFetched && !createReleaseOpen;
+  // The action bar belongs to the plain-tag arm alone.
+  const tagBarRef = useRef<HTMLDivElement>(null);
+  useToastClearance(tagBarRef, !showsSkeleton && !rel);
+  if (showsSkeleton) {
     return (
       <div className="space-y-3 p-4">
         <Skeleton className="h-5 w-2/3" />
@@ -925,7 +931,7 @@ export function TagDetailView({
             <DialogHeader>
               {/* Labelled from the `tag` PROP, which is also what the delete
                   targets — the rendered release can be the previous tag's. */}
-              <DialogTitle>Delete release {tag}?</DialogTitle>
+              <DialogTitle className="pr-8">Delete release {tag}?</DialogTitle>
               <DialogDescription>
                 Removes the {remoteLabel} release. This cannot be undone.
               </DialogDescription>
@@ -1000,7 +1006,10 @@ export function TagDetailView({
           <p className="text-[11px] text-muted-foreground">{publishNote}</p>
         )}
       </div>
-      <div className="flex flex-wrap items-center gap-2 border-t p-3">
+      <div
+        ref={tagBarRef}
+        className="flex flex-wrap items-center gap-2 border-t p-3"
+      >
         <Button
           variant="outline"
           size="sm"
@@ -1045,7 +1054,7 @@ export function TagDetailView({
       <Dialog open={deleteTagOpen} onOpenChange={setDeleteTagOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete tag {tag}?</DialogTitle>
+            <DialogTitle className="pr-8">Delete tag {tag}?</DialogTitle>
             <DialogDescription>
               Deletes the local tag. This cannot be undone.
             </DialogDescription>

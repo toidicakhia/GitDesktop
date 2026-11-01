@@ -132,6 +132,13 @@ pub fn run() {
                 tauri::async_runtime::spawn_blocking(|| {
                     git::compare::sweep_stale_persistent_review_worktrees();
                 });
+                // Capture the login shell's PATH for git children (a Finder/Dock
+                // launch inherits launchd's minimal one). Fire-and-forget: spawns use
+                // the inherited PATH until it lands.
+                #[cfg(not(windows))]
+                tauri::async_runtime::spawn(async {
+                    agent::prime_shell_path().await;
+                });
             }
             Ok(())
         })
@@ -193,6 +200,7 @@ pub fn run() {
             git::config::git_global_autocrlf,
             git::config::git_set_global_autocrlf,
             git::commit::git_undo_commit,
+            git::commit::git_commit_records_parent,
             git::commit::git_recent_commits,
             git::history::git_log,
             git::history::git_file_log,
@@ -694,6 +702,8 @@ pub fn run() {
             github::pr::gh_branch_protections,
             github::actions::gh_workflow_list,
             github::actions::gh_workflow_dispatchable,
+            github::actions::gh_runs_for_head,
+            github::actions::gh_run_jobs,
             fsops::append_to_gitignore,
             fsops::read_text_file,
             fsops::delete_repo_folder,
@@ -715,6 +725,7 @@ pub fn run() {
             git::remote::git_push,
             git::remote::git_remotes,
             git::remote::git_remote_url,
+            git::remote::git_remote_push_url,
             git::remote::git_remote_set_url,
             git::remote::git_remote_add,
             git::remote::git_remote_remove,
@@ -764,6 +775,16 @@ pub fn run() {
             tray::quit_app,
             app_menu::set_recent_repos_menu,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // A Dock click (or a Finder relaunch) on a close-to-tray-hidden window must
+            // bring it back; show/unminimize/focus is harmless when it's already shown.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                tray::show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, &event);
+        });
 }

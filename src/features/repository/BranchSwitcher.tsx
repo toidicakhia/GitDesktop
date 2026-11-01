@@ -9,7 +9,6 @@ import {
   CloudSlashIcon,
   CloudXIcon,
   GitBranchIcon,
-  GitPullRequestIcon,
   TreeStructureIcon,
   WarningIcon,
 } from "@phosphor-icons/react";
@@ -29,6 +28,8 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useRetryFocusRescue } from "@/features/conversations/ConversationListPanel";
 import {
   isDeletionBlocked,
   isMergeMethodAllowed,
@@ -42,7 +43,13 @@ import {
 import { clipTitle } from "@/lib/clip-title";
 import { copyText } from "@/lib/clipboard";
 import { isDirtyTreeRefusal, presentError } from "@/lib/error-summary";
-import { forgeDetectForkPrForBranch, gitBranches } from "@/lib/git/api";
+import { applyFrozenOrder } from "@/lib/frozen-order";
+import {
+  forgeDetectForkPrForBranch,
+  gitBranches,
+  gitRemotePushUrl,
+  gitRemoteUrl,
+} from "@/lib/git/api";
 import { normPath } from "@/lib/git/path";
 import {
   headTrackingMatchesRow,
@@ -56,6 +63,7 @@ import {
   branchPushHoldReason,
   branchPushLabel,
   branchRewriteStatusOptions,
+  carriesAllLocalCommits,
   forgeFeatureReady,
   nextPushLatch,
   REMOTE_BRANCHES_STALE_TIME,
@@ -101,6 +109,7 @@ import { isSessionBranchName } from "@/lib/git/ref-name";
 import type {
   Branch,
   BranchHead,
+  BranchRewriteStatus,
   ForkPrMatch,
   RemoteBranch,
 } from "@/lib/git/types";
@@ -121,6 +130,7 @@ import {
   type PrAuditState,
   REMOTE_AUDIT_STATE,
 } from "@/lib/pulls/audit";
+import { PR_AUDIT_ICON, PR_NOUN } from "@/lib/pulls/pr-state";
 import { useLocalPrs } from "@/lib/pulls/queries";
 import { useSetRepoLens } from "@/lib/repo-lens/queries";
 import {
@@ -129,7 +139,7 @@ import {
   useSaveSettings,
   useSettings,
 } from "@/lib/settings/queries";
-import { useConfirm } from "@/lib/stores/confirm";
+import { type ConfirmRequest, useConfirm } from "@/lib/stores/confirm";
 import {
   landedIn,
   refuseIfSwitched,
@@ -145,7 +155,7 @@ import {
   WORKTREE_PROMOTING_MESSAGE,
 } from "@/lib/stores/worktree-removal";
 import { isAppError } from "@/lib/tauri/invoke";
-import { errorToastAction, toastError } from "@/lib/toast";
+import { errorToastAction, toastError, toastErrorWithNote } from "@/lib/toast";
 import {
   ARIA_DISABLED_CLASS,
   useDisabledReason,
@@ -157,6 +167,21 @@ import {
   type MergeRunOptions,
   type PickerMode,
 } from "./BranchMergePickerDialog";
+import {
+  type BranchListMode,
+  branchListRetrying,
+  branchListState,
+} from "./branch-list-state";
+import {
+  isLocalUpstream,
+  presenceUnderUrls,
+  remoteHasBranch,
+  resolveUpdateFromDefault,
+  type UpdateSource,
+  visibilityApplies,
+  willCreateOnRemote,
+  willPublish,
+} from "./branch-sync-state";
 import {
   CleanupBranchesDialog,
   prCheckStateFrom,
@@ -172,6 +197,12 @@ import { DeleteWorktreeDialog } from "./DeleteWorktreeDialog";
 import { ForkPrPublishGuard } from "./ForkPrPublishGuard";
 import { OperationHistoryDialog } from "./OperationHistoryDialog";
 import { PromoteWorktreeDialog } from "./PromoteWorktreeDialog";
+import {
+  askPublishConfirm,
+  recordedVisibility,
+  useCloseSettled,
+  withdrawPublishConfirm,
+} from "./publish-confirm";
 import { RebaseOntoDialog } from "./RebaseOntoDialog";
 import { RenameBranchDialog } from "./RenameBranchDialog";
 import { StashesDialog } from "./StashesDialog";
@@ -210,6 +241,18 @@ const CLOSED_PR_SCAN_LIMIT = 100;
  *  rather than run per branch. Rows past the cap fall back to the waiting slot. */
 const MAX_REWRITE_PREFETCH = 4;
 
+/** The current branch's reset-to-upstream refusals when the confirm-time re-read
+ *  no longer matches what the row offered: the upstream tip moved, the branch
+ *  itself did, or the read couldn't prove the upstream still carries every
+ *  commit. KEEP IN STEP: SyncControls' twins name the Pull menu instead of the
+ *  branch menu (pinned by scripts/head-watcher.test.mjs). */
+const UPSTREAM_MOVED_NOTICE = (upstream: string) =>
+  `${upstream} moved since you opened this, so nothing was reset. Reopen the branch menu to see where it stands now.`;
+const LOCAL_MOVED_NOTICE = (branch: string) =>
+  `${branch} changed since you opened this, so nothing was reset. Reopen the branch menu to see where it stands now.`;
+const UNCONFIRMED_NOTICE = (upstream: string, branch: string) =>
+  `Couldn't confirm that ${upstream} still has every commit on ${branch}, so nothing was reset. Reopen the branch menu to check again.`;
+
 interface BranchPr {
   state: PrAuditState;
   /** "#123" for a remote PR, "local" for a local-only one. */
@@ -237,19 +280,85 @@ const PR_STATE_LABEL: Record<PrAuditState, string> = {
   closed: "Closed",
 };
 
-/** `branches` (already sorted) reordered by a snapshot of names: snapshot names in
- *  snapshot order, then branches the snapshot lacks in their sorted order. Names
- *  gone from `branches` drop out; a null snapshot keeps the sorted order. */
-function applyFrozenOrder(
-  branches: Branch[],
-  frozen: readonly string[] | null,
-): Branch[] {
-  if (frozen === null) return branches;
-  const rank = new Map(frozen.map((name, i) => [name, i] as const));
-  const known = branches
-    .filter((b) => rank.has(b.name))
-    .sort((a, b) => (rank.get(a.name) ?? 0) - (rank.get(b.name) ?? 0));
-  return [...known, ...branches.filter((b) => !rank.has(b.name))];
+/** One spelling for a failed branch-list read: the disabled reasons, the list's
+ *  failure line, and its status region all describe the same query. */
+const BRANCH_LIST_READ_FAILED = "Couldn't read the branch list.";
+
+/** The list's loading status, in `ListRowSkeletons`' "Loading {name}…" shape;
+ *  the disabled reasons' "Checking branches…" is a separate, deliberate line. */
+const BRANCH_LIST_LOADING = "Loading branches…";
+
+/** The list's announcement per mode while the menu is open; ready says nothing,
+ *  the rows do. */
+const BRANCH_LIST_STATUS: Record<BranchListMode, string> = {
+  pending: BRANCH_LIST_LOADING,
+  failed: BRANCH_LIST_READ_FAILED,
+  ready: "",
+};
+
+const BRANCH_SKELETON_ROWS = 4;
+
+/** Placeholders shaped like a branch row: its `gap-y-0.5 px-3 py-1.5` box, an h-4
+ *  name line, and a meta line as tall as the real row's text-[11px] spans (11px
+ *  at text-xs's inherited 1/0.75 line-height), so the rows that replace them
+ *  shift nothing. Local rather than `ListRowSkeletons`, whose rows are bordered
+ *  `py-2` boxes of full-width bars. */
+function BranchRowSkeletons() {
+  return (
+    <div aria-busy>
+      {/* Index key: a fixed static list that never reorders. */}
+      {Array.from({ length: BRANCH_SKELETON_ROWS }, (_, i) => (
+        <div key={i} className="flex flex-col gap-y-0.5 px-3 py-1.5">
+          <div className="flex h-4 items-center">
+            <Skeleton className="h-3 w-2/5" />
+          </div>
+          <div className="flex h-[calc(11px/0.75)] items-center">
+            <Skeleton className="h-2.5 w-1/4" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** The failure line's retry, held by `aria-disabled` while the read runs so it
+ *  keeps focus for the rescue when rows land. Not ARIA_DISABLED_CLASS: its
+ *  pointer-events-none lets a press fall through and take focus off the button,
+ *  and 50% opacity on primary misses AA (2.26:1 light, 3.13:1 slate; the muted
+ *  token used instead measures 5.18:1 or better, computed from App.css). */
+function BranchListRetry({
+  retrying,
+  retryRef,
+  onRetry,
+}: {
+  retrying: boolean;
+  retryRef: (node: HTMLElement | null) => () => void;
+  onRetry: () => void;
+}) {
+  const { blockedReason, reasonId, wrapperTitle, describedBy, nativeProps } =
+    useDisabledReason({
+      disabled: retrying,
+      reason: BRANCH_LIST_LOADING,
+      onClick: onRetry,
+    });
+  return (
+    <span className="flex shrink-0" title={wrapperTitle}>
+      <button
+        {...nativeProps}
+        ref={retryRef}
+        type="button"
+        aria-describedby={describedBy}
+        className="cursor-pointer font-medium text-primary hover:underline aria-disabled:cursor-not-allowed aria-disabled:text-muted-foreground aria-disabled:hover:no-underline"
+      >
+        Try again
+      </button>
+      {blockedReason ? (
+        <span id={reasonId} className="sr-only">
+          {blockedReason}
+        </span>
+      ) : null}
+    </span>
+  );
 }
 
 function MenuRow({
@@ -336,6 +445,10 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   const aiConfigured = useAiConfigured();
 
   const [open, setOpen] = useState(false);
+  // A publish prompt asked from the list waits for it to finish closing.
+  const listClose = useCloseSettled(open);
+  // The publish prompt this switcher asked last, so it withdraws only its own.
+  const publishAsk = useRef<ConfirmRequest | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   // Remote-only branches show expanded by default (the point is to see them);
   // archived shows collapsed (it's intentionally-hidden clutter).
@@ -614,6 +727,13 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
     return map;
   }, [prByBranch, defaultName]);
 
+  const prNoun = PR_NOUN[gh.data?.provider ?? "github"];
+  /** A row's PR in words: its state, the forge's noun, and the PR's label. */
+  const prChipLabel = (pr: BranchPr) =>
+    pr.select.kind === "local"
+      ? `${PR_STATE_LABEL[pr.state]} local pull request`
+      : `${PR_STATE_LABEL[pr.state]} ${prNoun} ${pr.label}`;
+
   const openPrChip = (select: SelectedPr) => {
     // Through the store's navigator rather than a bare select + tab switch: these
     // chips badge merged and closed PRs too, and only this door arms the align
@@ -685,13 +805,46 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   // Row ORDER freezes while the list is open, so an update that moves a branch's
   // commit date doesn't reorder rows under the pointer; row data stays live.
   // Snapshotted IN the open transition, so the first open frame already paints
-  // it — `onOpenChange` and the show-branches hotkey are the only ways in.
+  // it — `onOpenChange` and the show-branches hotkey are the only ways in. An
+  // open before the first read lands holds no snapshot (an empty one would
+  // freeze nothing), and the effect below takes it when the rows arrive.
   const [frozenOrder, setFrozenOrder] = useState<string[] | null>(null);
-  const snapshotOrder = () => setFrozenOrder(sortedBranches.map((b) => b.name));
+  // This instance outlives repo switches, and a held cross-repo landing can switch
+  // under an open menu: drop the old repo's snapshot and arrow cursor (both name
+  // its rows) so the effect below re-snapshots the new list. The filter stays: it
+  // is the user's visible input, and the switch can land mid-keystroke.
+  const [orderRepo, setOrderRepo] = useState(repoPath);
+  if (orderRepo !== repoPath) {
+    setOrderRepo(repoPath);
+    setFrozenOrder(null);
+    setActiveBranch(null);
+  }
+  const snapshotOrder = () =>
+    setFrozenOrder(
+      branches.data === undefined ? null : sortedBranches.map((b) => b.name),
+    );
+  // Idempotent: it acts only while the open list holds no snapshot, and a close
+  // clears the snapshot along with `open`.
+  useEffect(() => {
+    if (open && frozenOrder === null && branches.data !== undefined)
+      setFrozenOrder(sortedBranches.map((b) => b.name));
+  }, [open, frozenOrder, branches.data, sortedBranches]);
   const orderedBranches = useMemo(
-    () => applyFrozenOrder(sortedBranches, frozenOrder),
+    () => applyFrozenOrder(sortedBranches, frozenOrder, (b) => b.name),
     [sortedBranches, frozenOrder],
   );
+  const listState = branchListState({
+    errorUpdateCount: branches.errorUpdateCount,
+    hasData: branches.data !== undefined,
+  });
+  // The Try again line unmounts under focus when the rows land; the filter input
+  // survives every list state, so it takes the focus back.
+  const listRescue = useRetryFocusRescue(open && listState.mode === "failed");
+  // One string for the failure line and the status region, so they can't disagree.
+  const listRetrying = branchListRetrying(listState.mode, branches);
+  const listLine = listRetrying
+    ? BRANCH_LIST_LOADING
+    : BRANCH_LIST_STATUS[listState.mode];
   const bq = branchFilter.trim().toLowerCase();
   const visibleBranches = useMemo(
     () =>
@@ -722,9 +875,9 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
     repoPath,
     open || branchDialogOpen,
   );
-  // One prefetch per repo for the opens that skip the shell warm-up (notification
-  // and My work jumps), so the menu still opens with its Remote group. The hook
-  // stays open-gated; a fresh warmed entry makes this a no-op.
+  // One prefetch per repo for an open that skips the shell warm-up (a same-repo
+  // remount from a non-repo view), so the menu still opens with its Remote group.
+  // The hook stays open-gated; a fresh warmed entry makes this a no-op.
   useEffect(() => {
     if (!repoPath) return;
     void queryClient.prefetchQuery({
@@ -741,13 +894,17 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
     return (remoteBranchesQuery.data ?? [])
       .filter(
         (b) =>
-          !b.name.startsWith("gd/session/") &&
+          !isSessionBranchName(b.name) &&
           !localNames.has(b.name) &&
           (!bq || b.name.toLowerCase().includes(bq)),
       )
       .filter((b) => (seen.has(b.name) ? false : (seen.add(b.name), true)))
       .sort((a, b) => b.lastCommitDate.localeCompare(a.lastCommitDate));
   }, [remoteBranchesQuery.data, localNames, bq]);
+  // One gate for the Remote group's render and its arrow-key rows, so the nav
+  // list never reaches a row that isn't on screen.
+  const showRemoteSection =
+    listState.remoteGroupMayRender && remoteOnly.length > 0;
   // The ref being named, whose committed work the AI fallback describes: the
   // rename target (which need NOT be checked out) or the checked-out branch for
   // a create; null ⇒ both closed. Create names the BRANCH, not the literal
@@ -872,7 +1029,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   const navBranches: { name: string }[] = [
     ...visibleBranches,
     ...(showArchived ? archivedBranches : []),
-    ...(showRemote ? remoteOnly : []),
+    ...(showRemote && showRemoteSection ? remoteOnly : []),
   ];
   const onBranchKeyDown = listKeyboardNav({
     items: navBranches,
@@ -1060,23 +1217,26 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
         )
       )
         return;
-      // Awaited for its verdict: it resolves false both when the open failed
-      // (it toasts that itself) and, silently, when the user switched repos,
-      // navigated elsewhere, or started another open during its `validateRepo`
-      // and shell warm-up (useOpenWorktree's doc) — a success toast over any of
-      // those would claim a navigation that never happened.
-      // The attempt check rides INTO the open: those two awaits sit downstream
-      // of this function's guard, and a newer pick during them leaves the repo
-      // unchanged, so only the attempt identity can retire this one.
-      const navigated = await openWorktree(
-        wtPath,
-        () => switchRequest === switchRequestRef.current,
-      );
       // Only when this call resolved the worktree itself: that state is exactly
       // the one where the map was empty, so the row carried no chip and the whole
       // app just changed folders with no prior signal. Say so after the fact.
-      if (navigated && resolvedHere)
-        toast.success(rowCheckoutCopy(resolvedHere.isMain).opened(wtPath));
+      const openedCopy =
+        resolvedHere && rowCheckoutCopy(resolvedHere.isMain).opened(wtPath);
+      // The attempt check rides INTO the open: its `validateRepo` and shell
+      // warm-up sit downstream of this function's guard, and a newer pick during
+      // them leaves the repo unchanged, so only the attempt identity can retire
+      // this one. The toast waits for the landing: a failed open, one retired
+      // before it was requested, or a Settings-held one that Keep editing
+      // cancels never moved the app.
+      await openWorktree(
+        wtPath,
+        () => switchRequest === switchRequestRef.current,
+        {
+          onApplied: () => {
+            if (openedCopy) toast.success(openedCopy);
+          },
+        },
+      );
       return;
     }
     // with work in progress, let the user choose to bring or stash it
@@ -1598,10 +1758,18 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   // it (unless it's already current): fast-forwards when possible, otherwise
   // merges via a throwaway worktree so the working tree — and its watchers —
   // stay put. A conflicting merge aborts and reports rather than switching.
-  async function doUpdateFromDefault(target: string) {
+  // `base` is what the caller resolved (resolveUpdateFromDefault): the items
+  // pass the base their label named, so a list refresh under an open menu
+  // can't swap it between paint and click.
+  async function doUpdateFromDefault(target: string, base: string) {
     if (!defaultName || target === defaultName) return;
     if (refuseUpdateWhilePushing(target)) return;
-    const base = defaultName;
+    const probes = rewriteProbesFor(target, base);
+    if (probes.length > 0) {
+      if (await withheldForRewrite(probes, target)) return;
+      // The probe's await is a window another push can start in.
+      if (refuseUpdateWhilePushing(target)) return;
+    }
     // Only an in-place update can open the recovery dialog over the list; every
     // other row updates with the popover open and refreshes in place.
     if (target === currentName) setOpen(false);
@@ -1733,11 +1901,54 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
         // reads live; the captured name is the only branch the confirmation
         // described. Says so rather than returning quietly: the user just
         // confirmed a destructive action, and silence there reads as "it
-        // worked". Wording kept in step with the sync controls' twin.
+        // worked". Wording kept in step with the sync controls' twin and with
+        // HistoryDialogs' Reset to commit pre-check.
         if (currentNameRef.current !== branch.name) {
           toast.info(
             "HEAD moved while the dialog was open — nothing was reset.",
           );
+          return;
+        }
+        // An outside fetch can move the upstream while the prompt sits open, so
+        // the reset re-measures before it acts. A read that joins one in flight
+        // may have begun before that fetch's ref write and return the older tip;
+        // the reset then lands on the tip the probe proved carries every local
+        // commit.
+        let fresh: BranchRewriteStatus;
+        try {
+          fresh = await queryClient.fetchQuery({
+            ...branchRewriteStatusOptions(repoPath, branch.name),
+            staleTime: 0,
+          });
+        } catch (e) {
+          toastErrorWithNote(e, "Nothing was reset.");
+          return;
+        }
+        if (refuseIfSwitched(resetIn, "nothing was reset")) return;
+        // No measurable upstream tip proves nothing moved.
+        if (fresh.upstreamTip === null) {
+          toast.info(UNCONFIRMED_NOTICE(base, branch.name));
+          return;
+        }
+        if (fresh.upstreamTip !== tip) {
+          toast.info(UPSTREAM_MOVED_NOTICE(base));
+          return;
+        }
+        // Same upstream tip, but the read no longer proves the upstream carries
+        // every commit: name a local move only when the read measured one, since
+        // an unknown verdict (a failed reflog walk) proves nothing moved. A local
+        // move that is still carried proceeds, and the backend's pin refuses it.
+        if (!carriesAllLocalCommits(fresh)) {
+          if (fresh.localTip !== null && fresh.localTip !== localTip) {
+            toast.info(LOCAL_MOVED_NOTICE(branch.name));
+          } else {
+            toast.info(UNCONFIRMED_NOTICE(base, branch.name));
+          }
+          return;
+        }
+        // A promote can start during the re-read.
+        if (promotionBlocksCheckout(repoPath)) {
+          toast.info(PROMOTION_BLOCKS_CHECKOUT);
           return;
         }
         await hardReset.mutateAsync({
@@ -1762,14 +1973,14 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   // doUpdateFromUpstream. Whether this publishes (-u) or plain pushes is decided
   // backend-side from the branch's tracking state. The publish arms pass an
   // explicit `remote` (the chosen destination); a tracked push passes none and
-  // the backend resolves to the branch's own upstream remote. The list stays
-  // open: a push holds only the network lock, so the row shows its progress and
-  // the rest of the list stays usable.
+  // the backend resolves to the branch's own upstream remote. A tracked push or
+  // a publish the remote already has leaves the list open: a push holds only the
+  // network lock, so the row shows its progress and the rest of the list stays
+  // usable. A publish that would create the branch closes it for its prompt.
   function doPushBranch(branch: Branch, remote?: string) {
     if (refuseWhileOffline() || pushAlreadyActive()) return;
-    if (branch.upstream && !branch.upstreamGone)
-      void runPushBranch(branch, remote);
-    else void beginPublishBranch(branch, remote);
+    if (willPublish(branch)) void beginPublishBranch(branch, remote);
+    else void runPushBranch(branch, remote);
   }
 
   // One push at a time, re-checked where each network-lock route fires: a menu
@@ -1787,7 +1998,8 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   // Publishing a branch that is really a local copy of a fork PR's head pushes a
   // separate copy to this repo and leaves the PR untouched — check for that
   // first, and let the guard offer the fork instead. Advisory: a detection
-  // failure is indistinguishable from no match and just publishes.
+  // failure is indistinguishable from no match and falls through to the publish
+  // confirm.
   async function beginPublishBranch(branch: Branch, remote?: string) {
     const publishIn = repoPath;
     const mine: PublishDetect = {
@@ -1815,17 +2027,77 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
       return;
     }
     if (match) {
-      // The guard dialog takes over from the list.
+      // The guard dialog takes over from the list, and from this switcher's own
+      // publish prompt when a repeat press matched while it was up.
+      withdrawPublishConfirm(publishAsk);
       setOpen(false);
       setForkGuard({ match, branch, remote, repo: publishIn });
-    } else void runPushBranch(branch, remote);
+      return;
+    }
+    // A push that started during the detection refuses before any prompt.
+    if (pushAlreadyActive()) return;
+    // A named publish with no remote goes to origin (the backend's default). A
+    // branch the destination already has (as of the last fetch) only
+    // fast-forwards and tracks, so only a create asks first; the list mirrors the
+    // destination's FETCH side, so a differing push URL asks too.
+    const destination = remote ?? "origin";
+    const switchedAway = () =>
+      refuseIfSwitched(
+        publishIn,
+        "nothing was published",
+        "before the push started",
+      );
+    const [list, fetchUrl, pushUrl] = await Promise.all([
+      queryClient
+        .fetchQuery(remoteBranchesOptions(publishIn))
+        .catch(() => undefined),
+      gitRemoteUrl(publishIn, destination).catch(() => null),
+      gitRemotePushUrl(publishIn, destination).catch(() => null),
+    ]);
+    if (switchedAway()) return;
+    const create = willCreateOnRemote({
+      upstream: branch.upstream,
+      upstreamGone: branch.upstreamGone,
+      remoteHasSameName: presenceUnderUrls(
+        remoteHasBranch(list, destination, branch.name),
+        fetchUrl,
+        pushUrl,
+      ),
+    });
+    if (create) {
+      // The prompt takes over from the list; it opens once the list's close
+      // has returned focus to its trigger, and it stamps whichever repo is live
+      // when it asks. Without a prompt the list stays open while the row pushes.
+      setOpen(false);
+      await listClose.waitClosed();
+      if (switchedAway()) return;
+      const ok = await askPublishConfirm(
+        {
+          branch: branch.name,
+          remote: destination,
+          pushUrl,
+          visibility: visibilityApplies(destination, fetchUrl, pushUrl)
+            ? recordedVisibility(settings.data?.recentRepos, publishIn)
+            : null,
+          goneUpstream: branch.upstreamGone,
+          upstreamRemote: branch.upstreamRemote,
+          upstreamBranch: branch.upstreamRemoteRef?.startsWith("refs/heads/")
+            ? branch.upstreamRemoteRef.slice("refs/heads/".length)
+            : null,
+        },
+        publishAsk,
+      );
+      if (!ok) return;
+    }
+    // runPushBranch re-checks offline and running pushes at its own entry.
+    void runPushBranch(branch, remote);
   }
 
   async function runPushBranch(branch: Branch, remote?: string) {
     // The fork-PR guard's "Publish anyway" and the detection's fall-through land
     // here without passing doPushBranch.
     if (refuseWhileOffline() || pushAlreadyActive()) return;
-    const publishing = !branch.upstream || branch.upstreamGone;
+    const publishing = willPublish(branch);
     try {
       await push.mutateAsync({
         setUpstream: false,
@@ -1965,7 +2237,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   const branchesUnread = unread(
     branches,
     "Checking branches…",
-    "Couldn't read the branch list.",
+    BRANCH_LIST_READ_FAILED,
   );
   const stashCountUnread = unread(
     stashCount,
@@ -2006,6 +2278,9 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
     if (!currentName)
       return headUnread ?? "HEAD is detached — there's no branch to update.";
     if (defaultName === currentName) return `You're already on ${defaultName}.`;
+    // Without the list, the default's upstream is unknown, and so is the base. A
+    // promotion rule holds whether or not the list lands, so it isn't displaced.
+    if (branchesUnread && !currentPromotion) return branchesUnread;
     // An in-place update waits on the network lock a push holds.
     if (pushActive) return branchPushHoldReason(pushPaused);
     if (busy) return "Another git operation is running.";
@@ -2203,7 +2478,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
       branch.upstreamBehind === 0
     ) {
       doPushBranch(branch);
-    } else if (!branch.upstream || branch.upstreamGone) {
+    } else if (willPublish(branch)) {
       // `enabled` guarantees origin exists, so this publish destination is safe.
       doPushBranch(branch, "origin");
     } else if (
@@ -2221,11 +2496,11 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
       toast.info(`${branch.name} is behind ${branch.upstream} — pull first`);
     } else if (tracksOrigin) {
       toast.info(`${branch.name} has nothing to push`);
-    } else if (branch.upstream && !branch.upstreamRemote) {
-      // Tracks a LOCAL branch (`git branch --track x main`):
-      // `%(upstream:remotename)` is empty → null upstreamRemote. There's
-      // nothing remote-related to say — and the context menu is the same
-      // authority (it offers neither Push nor Publish for these).
+    } else if (branch.upstream && isLocalUpstream(branch.upstreamRemote)) {
+      // Tracks a LOCAL branch (`git branch --track x main`), whose
+      // `%(upstream:remotename)` git reports as `.`. There's nothing
+      // remote-related to say — and the context menu is the same authority (it
+      // offers neither Push nor Publish for these).
       toast.info(
         `${branch.name} tracks a local branch (${branch.upstream}), not a remote`,
       );
@@ -2298,20 +2573,32 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
     setOpen(false);
     setCleanupOpen(true);
   });
+  const defaultBranchRow = allBranches.find((b) => b.name === defaultName);
+  // What the update items merge, as of the last fetch: the default's own
+  // upstream tip when the local default is strictly behind it.
+  const updateSources = defaultName
+    ? resolveUpdateFromDefault(defaultName, defaultBranchRow)
+    : null;
   useHotkeyAction(
     "update-from-default",
     () => {
-      if (currentName) void doUpdateFromDefault(currentName);
+      // Renders nothing, so it resolves its base at fire time.
+      if (currentName && defaultName)
+        void doUpdateFromDefault(
+          currentName,
+          resolveUpdateFromDefault(defaultName, defaultBranchRow).primary.base,
+        );
     },
     Boolean(
       defaultName &&
         defaultName !== currentName &&
+        // An unread list would resolve the base to the local default.
+        !branchesUnread &&
         !busy &&
         currentName &&
         !currentPromotion,
     ),
   );
-  const defaultBranchRow = allBranches.find((b) => b.name === defaultName);
   // The palette's own route to the same merge the row menu offers — so it needs
   // the same refusal. There is no row rendered here to hang the probe's hook on,
   // so it runs ON INVOCATION against the hook's own cached options: a diverged
@@ -2320,41 +2607,95 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   async function updateDefaultFromUpstream() {
     const row = defaultBranchRow;
     if (!row?.upstream || row.upstreamGone) return;
-    if (row.upstreamAhead > 0 && row.upstreamBehind > 0) {
-      const updateIn = repoPath;
-      const status = await queryClient
-        .fetchQuery(branchRewriteStatusOptions(repoPath, row.name))
-        .catch(() => null);
-      // The update builds from the live repo's options once the probe resolves,
-      // while the row belongs to this one: a switch during it refuses instead.
-      if (
-        refuseIfSwitched(
-          updateIn,
-          `${row.name} wasn't updated`,
-          "before the update started",
-        )
+    // The update builds from the live repo's options once the probe resolves,
+    // while the row belongs to this one: a switch during it refuses instead.
+    if (
+      row.upstreamAhead > 0 &&
+      row.upstreamBehind > 0 &&
+      (await withheldForRewrite([row], row.name))
+    )
+      return;
+    void doUpdateFromUpstream(row.name, row.upstream);
+  }
+  // `patchEqual > 0` is strong evidence, not proof — two sides can apply the
+  // same patch independently. It only WITHHOLDS a merge, so a false read costs
+  // an explained no-op, never a duplicated history.
+  function rewrittenUpstream(status: BranchRewriteStatus) {
+    return status.remoteRewritten === true && status.patchEqual > 0;
+  }
+  function warnRewrittenUpstream(row: Branch, status: BranchRewriteStatus) {
+    // The remedy has to match what the row actually offers: only the
+    // nothing-unique case gets a reset item there. With local-only commits the
+    // row shows a disabled update and no reset, so point at the pull that keeps
+    // them.
+    const remedy = carriesAllLocalCommits(status)
+      ? `Open the branch menu and use the ${row.name} row's reset instead.`
+      : `Switch to ${row.name} and use Pull with rebase — it keeps the ${status.localOnly} commit${status.localOnly === 1 ? "" : "s"} only ${row.name} has.`;
+    toast.warning(
+      `${row.upstream} already carries ${row.name}'s changes under different ids — merging it in would duplicate them.`,
+      { description: remedy, duration: 10000 },
+    );
+  }
+  // The fire-time rewrite probes an update from the default branch needs, each
+  // gated as updateDefaultFromUpstream's is: only a DIVERGED branch can hold a
+  // rewrite (a duplicate takes local commits with patch twins upstream). Merging
+  // the default's diverged upstream (the secondary item's base): that upstream
+  // may carry the default's commits rewritten. Merging a branch's OWN diverged
+  // upstream: only the footer and hotkey reach it, having no own-upstream item
+  // to carry the row's render-time probe (the row menu omits that duplicate).
+  function rewriteProbesFor(target: string, base: string): Branch[] {
+    const rows: Branch[] = [];
+    const def = defaultBranchRow;
+    if (
+      def &&
+      !def.upstreamGone &&
+      def.upstream === base &&
+      def.upstreamAhead > 0 &&
+      def.upstreamBehind > 0
+    )
+      rows.push(def);
+    // The unfiltered list: a checked-out gd/session/* branch still updates
+    // from the hotkey and footer, and still needs its own-row probe.
+    const own = branches.data?.find((b) => b.name === target);
+    if (
+      own &&
+      !own.upstreamGone &&
+      own.upstream === base &&
+      own.upstreamAhead > 0 &&
+      own.upstreamBehind > 0
+    )
+      rows.push(own);
+    return rows;
+  }
+  // Runs the probes against the hook's own cached options; true = withheld
+  // (with a warning) or the repo changed during them (with its notice).
+  async function withheldForRewrite(
+    rows: Branch[],
+    target: string,
+  ): Promise<boolean> {
+    const updateIn = repoPath;
+    const statuses = await Promise.all(
+      rows.map((r) =>
+        queryClient
+          .fetchQuery(branchRewriteStatusOptions(repoPath, r.name))
+          .catch(() => null),
+      ),
+    );
+    if (
+      refuseIfSwitched(
+        updateIn,
+        `${target} wasn't updated`,
+        "before the update started",
       )
-        return;
-      // `patchEqual > 0` is strong evidence, not proof — two sides can apply the
-      // same patch independently. It only WITHHOLDS the merge, so a false read
-      // costs an explained no-op, never a duplicated history.
-      if (status?.remoteRewritten === true && status.patchEqual > 0) {
-        // The remedy has to match what the row actually offers: only the
-        // nothing-unique case gets a reset item there. With local-only commits
-        // the row shows a disabled update and no reset, so point at the pull that
-        // keeps them.
-        const remedy =
-          status.localOnly === 0
-            ? `Open the branch menu and use the ${row.name} row's reset instead.`
-            : `Switch to ${row.name} and use Pull with rebase — it keeps the ${status.localOnly} commit${status.localOnly === 1 ? "" : "s"} only ${row.name} has.`;
-        toast.warning(
-          `${row.upstream} already carries ${row.name}'s changes under different ids — merging it in would duplicate them.`,
-          { description: remedy, duration: 10000 },
-        );
-        return;
+    )
+      return true;
+    for (const [i, status] of statuses.entries()) {
+      if (status && rewrittenUpstream(status)) {
+        warnRewrittenUpstream(rows[i], status);
+        return true;
       }
     }
-    void doUpdateFromUpstream(row.name, row.upstream);
+    return false;
   }
   useHotkeyAction(
     "update-default-from-upstream",
@@ -2482,6 +2823,15 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
   const renderBranchRow = (branch: Branch) => {
     const div = divByName.get(branch.name);
     const canUpdate = Boolean(defaultName) && branch.name !== defaultName;
+    // The update-from-default items, minus one whose base is this row's OWN
+    // upstream: the own-upstream item offers that same merge, and it carries
+    // the rewrite probe.
+    const rowUpdateSources =
+      canUpdate && updateSources
+        ? [updateSources.primary, updateSources.secondary].filter(
+            (s): s is UpdateSource => s !== null && s.base !== branch.upstream,
+          )
+        : [];
     const deletionBlocked = isDeletionBlocked(rulesConfig, branch.name);
     // A promotion branch takes its changes through promotions, so the one-click
     // update from the default branch is withheld.
@@ -2662,13 +3012,9 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
     // The pair, never the reflog verdict alone: offering a reset while unique
     // local work exists would destroy it. Both measured shas ride the item, the
     // upstream tip it lands on and the local tip the backend pins.
-    const resetTip =
-      rowRewrite?.remoteRewritten === true &&
-      rowRewrite.localOnly === 0 &&
-      rowRewrite.upstreamTip &&
-      rowRewrite.localTip
-        ? { tip: rowRewrite.upstreamTip, localTip: rowRewrite.localTip }
-        : null;
+    const resetTip = carriesAllLocalCommits(rowRewrite)
+      ? { tip: rowRewrite.upstreamTip, localTip: rowRewrite.localTip }
+      : null;
     // Patch twins upstream AND commits without one: a reset would destroy the
     // latter, and a merge would bring the twinned changes back in beside the
     // copies already there. `patchEqual > 0` is strong evidence, not proof — two
@@ -2679,6 +3025,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
       rowRewrite?.remoteRewritten === true &&
       rowRewrite.localOnly > 0 &&
       rowRewrite.patchEqual > 0;
+    const pr = prByBranch.get(branch.name);
     return (
       <ContextMenu
         key={branch.name}
@@ -2698,7 +3045,17 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
               data-row={branch.name}
               className="flex w-full flex-col gap-y-0.5 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
               onFocus={() => focusRow(branch.name)}
-              onClick={() => {
+              onClick={(e) => {
+                // The PR chip is part of this button (no nested control), so a
+                // click on it is routed here; Enter on the row still switches.
+                if (
+                  pr &&
+                  e.target instanceof Element &&
+                  e.target.closest("[data-pr-chip]")
+                ) {
+                  openPrChip(pr.select);
+                  return;
+                }
                 if (!branch.isCurrent) void switchTo(branch.name);
               }}
             >
@@ -2719,40 +3076,29 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
                 )}
               </span>
               <span className="flex w-full items-center gap-2">
-                {(() => {
-                  const pr = prByBranch.get(branch.name);
-                  if (!pr) return null;
-                  const isLocal = pr.select.kind === "local";
-                  return (
-                    <span
-                      role="button"
-                      tabIndex={0}
-                      title={
-                        isLocal
-                          ? `${PR_STATE_LABEL[pr.state]} local pull request — open in Pull Requests`
-                          : `${PR_STATE_LABEL[pr.state]} pull request ${pr.label} — open in Pull Requests`
-                      }
-                      className={cn(
-                        "flex shrink-0 cursor-pointer items-center gap-0.5 text-[11px] tabular-nums hover:underline",
-                        PR_AUDIT_TONE[pr.state],
-                      )}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openPrChip(pr.select);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          openPrChip(pr.select);
-                        }
-                      }}
-                    >
-                      <GitPullRequestIcon className="size-3" weight="bold" />
-                      {pr.label}
-                    </span>
-                  );
-                })()}
+                {pr &&
+                  (() => {
+                    const Icon = PR_AUDIT_ICON[pr.state];
+                    const label = prChipLabel(pr);
+                    // Not a control of its own: the row's click routing opens
+                    // it, the row menu reaches it by keyboard, and its words
+                    // join the row's accessible name.
+                    return (
+                      <span
+                        role="img"
+                        data-pr-chip
+                        aria-label={label}
+                        title={`${label} — open in the PRs tab`}
+                        className={cn(
+                          "flex shrink-0 cursor-pointer items-center gap-0.5 text-[11px] tabular-nums hover:underline",
+                          PR_AUDIT_TONE[pr.state],
+                        )}
+                      >
+                        <Icon className="size-3" weight="bold" />
+                        {pr.label}
+                      </span>
+                    );
+                  })()}
                 {rowWorktree && (
                   <span
                     className="flex shrink-0 items-center gap-0.5 text-[11px] text-muted-foreground"
@@ -2773,14 +3119,14 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
                     // A branch tracking a REMOVED remote offers neither Push
                     // nor Publish, so arrows would imply an action the menu
                     // can't honor — muted marker with a no-action title
-                    // instead. The `branch.upstreamRemote &&` conjunct keeps a
-                    // LOCAL-upstream branch (git's `%(upstream:remotename)` is
-                    // empty → null) out of this case so its truthful arrows
-                    // still show below.
+                    // instead. The `isLocalUpstream` conjunct keeps a
+                    // LOCAL-upstream branch (git's `%(upstream:remotename)`
+                    // reads `.`) out of this case so its truthful arrows still
+                    // show below.
                     if (
                       branch.upstream &&
                       !branch.upstreamGone &&
-                      branch.upstreamRemote &&
+                      !isLocalUpstream(branch.upstreamRemote) &&
                       !remoteNames.includes(branch.upstreamRemote)
                     ) {
                       const label = `Tracks ${branch.upstream}, but that remote is no longer configured.`;
@@ -2920,27 +3266,28 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
           }
         />
         <ContextMenuContent className="min-w-48">
-          {(canUpdate ||
+          {(rowUpdateSources.length > 0 ||
             (branch.upstream && branch.upstreamBehind > 0) ||
             pushable ||
             publishable) && (
             <>
-              {canUpdate && (
+              {rowUpdateSources.map((source) => (
                 <ContextMenuItem
+                  key={source.base}
                   className={MENU_HELD_ROW_CLASS}
                   disabled={
                     rowUpdateHeld || rowPromotion || rowWorktreeRemoving
                   }
                   onClick={() => {
                     fallThroughGuardUntil.current = Date.now() + 300;
-                    void doUpdateFromDefault(branch.name);
+                    void doUpdateFromDefault(branch.name, source.base);
                   }}
                 >
                   {rowPromotion
-                    ? `Update from ${defaultName} (promotion branch)`
-                    : wtLabel(`Update from ${defaultName}`, updateHeldReason)}
+                    ? `${source.label} (promotion branch)`
+                    : wtLabel(source.label, updateHeldReason)}
                 </ContextMenuItem>
-              )}
+              ))}
               {/* Pull the branch's own upstream in without switching — the star
                   use case is the default branch after a PR merged upstream. An
                   upstream that already carries this branch's changes under other
@@ -3066,6 +3413,13 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
               )}
               <ContextMenuSeparator />
             </>
+          )}
+          {pr && (
+            <ContextMenuItem onClick={() => openPrChip(pr.select)}>
+              {pr.select.kind === "local"
+                ? "View local pull request"
+                : `View ${prNoun} ${pr.label}`}
+            </ContextMenuItem>
           )}
           <ContextMenuItem
             className={MENU_HELD_ROW_CLASS}
@@ -3318,6 +3672,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
             setFrozenOrder(null);
           }
         }}
+        onOpenChangeComplete={listClose.onOpenChangeComplete}
       >
         <Popover.Trigger
           render={
@@ -3485,6 +3840,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
               )}
               <div className="border-b p-2">
                 <Input
+                  ref={listRescue.hostRef}
                   value={branchFilter}
                   onChange={(e) => setBranchFilter(e.target.value)}
                   placeholder="Filter branches"
@@ -3493,7 +3849,21 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
                 />
               </div>
               <div className="max-h-60 overflow-y-auto">
-                {visibleBranches.length === 0 &&
+                {listState.mode === "pending" && <BranchRowSkeletons />}
+                {listState.mode === "failed" && (
+                  <div className="flex items-center gap-2 px-3 py-4 text-xs">
+                    <span className="min-w-0 flex-1 text-muted-foreground">
+                      {listLine}
+                    </span>
+                    <BranchListRetry
+                      retrying={listRetrying}
+                      retryRef={listRescue.retryRef}
+                      onRetry={() => void branches.refetch()}
+                    />
+                  </div>
+                )}
+                {listState.mode === "ready" &&
+                  visibleBranches.length === 0 &&
                   archivedBranches.length === 0 &&
                   remoteOnly.length === 0 && (
                     <p className="px-3 py-4 text-center text-xs text-muted-foreground">
@@ -3521,7 +3891,7 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
                     {showArchived && archivedBranches.map(renderBranchRow)}
                   </>
                 )}
-                {remoteOnly.length > 0 && (
+                {showRemoteSection && (
                   <>
                     <button
                       type="button"
@@ -3672,18 +4042,45 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
                     !defaultName ||
                     !currentName ||
                     defaultName === currentName ||
+                    branchesUnread !== null ||
                     pushActive ||
                     busy ||
                     currentPromotion
                   }
                   reason={updateFromDefaultBlockedReason}
                   onClick={() => {
-                    if (currentName) void doUpdateFromDefault(currentName);
+                    if (currentName && updateSources)
+                      void doUpdateFromDefault(
+                        currentName,
+                        updateSources.primary.base,
+                      );
                   }}
                 >
-                  Update from {defaultName ?? "default branch"}
+                  {updateSources?.primary.label ?? "Update from default branch"}
                   {currentPromotion ? " (promotion branch)" : ""}
                 </MenuRow>
+                {updateSources?.secondary && (
+                  <MenuRow
+                    disabled={
+                      !currentName ||
+                      defaultName === currentName ||
+                      pushActive ||
+                      busy ||
+                      currentPromotion
+                    }
+                    reason={updateFromDefaultBlockedReason}
+                    onClick={() => {
+                      if (currentName && updateSources.secondary)
+                        void doUpdateFromDefault(
+                          currentName,
+                          updateSources.secondary.base,
+                        );
+                    }}
+                  >
+                    {updateSources.secondary.label}
+                    {currentPromotion ? " (promotion branch)" : ""}
+                  </MenuRow>
+                )}
                 <MenuRow
                   disabled={
                     otherBranches.length === 0 ||
@@ -3737,6 +4134,13 @@ export function BranchSwitcher({ repoPath }: { repoPath: string }) {
           </Popover.Positioner>
         </Popover.Portal>
       </Popover.Root>
+      {/* The list's live region, outside the portal so it stays mounted: text
+          a region already holds when it enters the a11y tree is never announced,
+          and the popup remounts on every open. Each open of a loading or failed
+          list changes this text, and so do a retry and its repeat failure. */}
+      <span role="status" className="sr-only">
+        {open ? listLine : ""}
+      </span>
 
       <CreateBranchDialog
         repoPath={repoPath}

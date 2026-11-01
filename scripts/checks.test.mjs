@@ -91,13 +91,10 @@ import {
   verdict as reusedViewVerdict,
 } from "./check-reused-view-pending.mjs";
 import {
-  CARRIERS,
-  MOUNTED_CARRIERS,
-  missingSentinels,
-} from "./check-rule-mirrors.mjs";
-import {
   checkBareBranchRevs,
   checkCompareEndpoints,
+  checkDiffExternalDrivers,
+  checkGhExitAbsence,
   checkMergeIgnoredGuard,
   checkRefspecTemplates,
   checkSecretArgv,
@@ -106,9 +103,12 @@ import {
   checkSyncCommands,
   checkTestMarkerBranches,
   enclosingFn,
+  GH_EXIT_ABSENCE_ALLOWLIST,
+  ghExitAbsenceScope,
   lexRust,
   MERGE_GUARD_ALLOWLIST,
   MERGE_GUARD_NOTE,
+  reportEmptyGhScope,
   splitStaleEntries,
   staleAllowlistEntries,
   TEST_MARKER_ALLOWLIST,
@@ -1542,7 +1542,7 @@ test("binary-marker-single-source exempts the helper module only", () => {
   assert.equal(appliesTo("src/features/pulls/RemotePrView.tsx"), true);
   assert.equal(appliesTo("src/features/pulls/PrCommitDetail.tsx"), true);
   assert.equal(appliesTo("src/lib/ai/prompt.ts"), true);
-  assert.deepEqual(allowlist, ["src/lib/ai/prompt.ts"]);
+  assert.deepEqual(allowlist, []);
 });
 
 test("null-suspense-fallback flags the literal on one line or wrapped", () => {
@@ -2535,7 +2535,7 @@ test("preparing-slot-hide premise: the real roles, hosts and sites", () => {
   assert.ok(check.expectScanned.atLeast >= 500);
   const hosts = [
     "src/features/actions/run-slots.tsx",
-    "src/features/diff/DiffViewer.tsx",
+    "src/features/diff/file-slot.tsx",
   ];
   for (const file of hosts) {
     const source = read(file);
@@ -4876,6 +4876,205 @@ test("stripComments blanks comments but not comment-shaped strings", () => {
 
 // -------------------------------------------------------- check-rust-invariants
 
+function diffDriverHits(src, allowlist) {
+  const hits = [];
+  checkDiffExternalDrivers("git/diff.rs", src, src.split("\n"), hits, allowlist);
+  return hits;
+}
+
+test("diff drivers require a flag on patches, quiet and exit-code verdicts", () => {
+  for (const argv of [
+    '["diff", "--no-color"]',
+    'vec!("diff", "--no-color")',
+    'vec!{"diff", "--no-color"}',
+    '["diff", "--numstat", "-p", r]',
+    '["diff", "--numstat", "-U"]',
+    '["diff", "--numstat", "--binary"]',
+    '["diff", "--name-only", "--quiet"]',
+    '["diff", "--numstat", "--foo"]',
+    '["diff", "--name-only", "--exit-code"]',
+    '["diff", "--numstat", "--exit-code"]',
+    '["diff", "--numstat", "-pz"]',
+    '["diff", "--numstat", "-zp"]',
+    'vec!["diff".to_string(), x]',
+    'vec![String::from("diff"), "--numstat".into(), "-p".into()]',
+    '["diff", "--name-only", "--patch"]',
+    '["diff", "--cached", "--quiet"]',
+    '["diff", "--exit-code"]',
+    '["-C", repo, "diff", "--no-color"]',
+    '["--git-dir=repo", "diff", "--no-color"]',
+    '["diff", "--", "--no-ext-diff"]',
+  ]) {
+    const hits = diffDriverHits(`fn patch() { run(${argv}); }`);
+    assert.equal(hits.length, 1, argv);
+    assert.equal(hits[0].allowlisted, false, argv);
+    assert.equal(hits[0].fn, "patch");
+    assert.match(hits[0].fix, /--no-ext-diff/);
+  }
+});
+
+test("diff drivers reject explicit external-driver enabling regardless of flag order", () => {
+  for (const argv of [
+    '["diff", "--no-ext-diff", "--ext-diff"]',
+    '["diff", "--ext-diff", "--no-ext-diff"]',
+    '["diff", "--numstat", "--ext-diff"]',
+    '["show", "--ext-diff", sha]',
+    '["log", "-p", "--ext-diff"]',
+    '["diff-tree", "--ext-diff".to_owned(), sha]',
+    '["-C", "--", "diff", "--no-ext-diff", "--ext-diff"]',
+    '["-p", "--ext-diff", "HEAD"]',
+    '["--ext-diff", "diff"]',
+  ]) {
+    const hits = diffDriverHits(`fn patch() { run(${argv}); }`);
+    assert.equal(hits.length, 1, argv);
+    assert.equal(hits[0].allowlisted, false, argv);
+    assert.match(hits[0].fix, /drop --ext-diff/);
+  }
+  for (const call of [
+    'Command::new("git").arg("show").args(["--ext-diff", "HEAD"])',
+    'cmd.arg("diff").args(["--ext-diff", "HEAD"])',
+  ]) {
+    const hits = diffDriverHits(`fn patch() { ${call}; }`);
+    assert.equal(hits.length, 1, call);
+    assert.equal(hits[0].allowlisted, false, call);
+    assert.match(hits[0].fix, /drop --ext-diff/);
+  }
+  assert.deepEqual(diffDriverHits('fn log() { run(&["-c", "--ext-diff", "log"]); }'), []);
+});
+
+test("diff drivers retain every production exempt argv shape", () => {
+  for (const [site, argv] of [
+    ["diff.rs staged", '["diff", base, "--numstat", "-z"]'],
+    ["diff.rs cached stats", '["diff", "--cached", "--numstat", "-z"]'],
+    ["diff.rs working stats", '["diff", "--numstat", "-z"]'],
+    ["compare.rs branch stats", '["diff", "--numstat", "-z", &format!("{base}...{compare}")]'],
+    ["compare.rs branch compare", '["diff", "--numstat", "-z", &range]'],
+    ["compare.rs range delta", '["diff", "--numstat", "-z", &range]'],
+    ["ops.rs selected staged", '["diff", "--cached", "--no-renames", "-z", "--name-only"]'],
+    ["ops.rs selected paths", '["diff", "--cached", "--no-renames", "-z", "--name-only", "--"]'],
+    ["ops.rs conflicts", '["diff", "--name-only", "--diff-filter=U"]'],
+    ["ignored_guard.rs", '["diff", "--no-relative", "--name-only", "--no-renames", "--diff-filter=d", "-z", &format!("HEAD...{incoming_sha}")]'],
+    ["stats.rs", '["diff", "--numstat", &merge_range]'],
+  ]) {
+    assert.deepEqual(diffDriverHits(`fn stats() { run(&${argv}); }`), [], site);
+  }
+});
+
+test("diff drivers exempt only known options alongside a machine-readable mode", () => {
+  for (const option of ["-z", "--no-color", "--cached", "--staged", "--no-renames", "--no-relative", "--find-renames", "--find-renames=50%", "-M", "-M50%", "--diff-filter=U", "--relative", "--relative=src/", "--ignore-submodules", "--ignore-submodules=all"]) {
+    assert.deepEqual(diffDriverHits(`fn stats() { run(&["diff", "--numstat", "${option}"]); }`), [], option);
+  }
+  assert.deepEqual(diffDriverHits('fn stats() { run(&["diff", "--name-only", "-z", "--cached"]); }'), []);
+  assert.deepEqual(diffDriverHits('fn stats() { run(&["diff", "--numstat", "--", "--quiet"]); }'), []);
+  assert.deepEqual(diffDriverHits('fn show() { run(&["show", "--", "--ext-diff"]); }'), []);
+  for (const option of ["--quiet", "--binary", "--stat", "--stat=80", "--raw", "-W", "--word-diff", "--word-diff=plain", "--color-words"]) {
+    const hits = diffDriverHits(`fn patch() { run(&["diff", "--numstat", "${option}"]); }`);
+    assert.equal(hits.length, 1, option);
+    assert.equal(hits[0].allowlisted, false, option);
+  }
+});
+
+test("diff drivers resolve owned literal verbs and flags", () => {
+  for (const verb of ['"diff".to_string()', '"diff".into()', '"diff".to_owned()', 'String::from("diff")']) {
+    const hits = diffDriverHits(`fn patch() { run(vec![${verb}, x]); }`);
+    assert.equal(hits.length, 1, verb);
+    assert.equal(hits[0].allowlisted, false, verb);
+    assert.deepEqual(diffDriverHits(`fn patch() { run(vec![${verb}, "--no-ext-diff".into()]); }`), []);
+    assert.deepEqual(diffDriverHits(`fn stats() { run(vec![${verb}, "--numstat".to_owned(), String::from("-z")]); }`), []);
+  }
+});
+
+test("diff drivers require protection when machine-readable output also requests a patch", () => {
+  for (const flag of ["-p", "-u", "-U", "--patch", "--patch-with-raw", "--patch-with-stat", "-U3", "--unified", "--unified=3"]) {
+    for (const output of ["--numstat", "--name-only", "--name-status"]) {
+      const argv = `"diff", "${output}", "${flag}", r`;
+      const hits = diffDriverHits(`fn patch() { run(&[${argv}]); }`);
+      assert.equal(hits.length, 1, argv);
+      assert.equal(hits[0].allowlisted, false, argv);
+      assert.deepEqual(diffDriverHits(`fn patch() { run(&[${argv}, "--no-ext-diff"]); }`), []);
+    }
+  }
+  for (const [open, close] of [["[", "]"], ["(", ")"], ["{", "}"]]) {
+    assert.deepEqual(diffDriverHits(`fn patch() { run(vec!${open}"diff", "--no-ext-diff"${close}); }`), []);
+  }
+});
+
+test("diff drivers do not treat a test-module header inside a string as a module", () => {
+  const hits = diffDriverHits('fn a() { let s = "#[cfg(test)] mod t {"; run(&["diff"]); }');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "a");
+  assert.equal(hits[0].allowlisted, false);
+});
+
+test("diff drivers accept explicit protection and machine-readable output", () => {
+  for (const flag of ["--no-ext-diff", "--numstat", "--name-only", "--name-status"]) {
+    for (const prefix of ['"diff"', '"-c", config, "diff"']) {
+      assert.deepEqual(
+        diffDriverHits(`fn patch() { run(&[${prefix}, "${flag}", path]); }`),
+        [],
+      );
+    }
+  }
+  for (const argv of [
+    '["-c", "core.quotepath=off", "diff", "--numstat"]',
+    '["-C", p, "diff", "--numstat"]',
+    '["--no-pager", "diff", "--name-only"]',
+  ]) {
+    assert.deepEqual(diffDriverHits(`fn stats() { run(&${argv}); }`), [], argv);
+  }
+  assert.deepEqual(diffDriverHits('fn pr() { run(&["pr", "diff"]); }'), []);
+  assert.deepEqual(diffDriverHits('fn opaque() { let x = [a, b]; }'), []);
+  assert.deepEqual(diffDriverHits('fn text() { let s = "[\\\"diff\\\"]"; }'), []);
+  assert.deepEqual(diffDriverHits('// ["diff", "--quiet"]'), []);
+});
+
+test("diff drivers exclude named and visibility-qualified test modules by span", () => {
+  for (const module of ["mod tests", "mod config_tests", "pub(crate) mod tests"]) {
+    const src = `#[cfg(test)] ${module} { fn fixture() { run(&["diff", "--no-color"]); } }`;
+    assert.deepEqual(diffDriverHits(src), []);
+    const hits = diffDriverHits(`${src}\nfn production() { run(&["diff"]); }`);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].fn, "production");
+  }
+});
+
+test("diff drivers attribute const/static initializers separately from functions", () => {
+  const row = {
+    file: "git/diff.rs",
+    fn: "REQUESTED_ATTRS",
+    item: true,
+    rationale: "Attribute names passed to check-attr, never a git argv",
+  };
+  for (const kind of ["const", "pub const", "pub(crate) static"]) {
+    const src = `${kind} REQUESTED_ATTRS: [&str; 2] = ["diff", "filter"];`;
+    const hits = diffDriverHits(src);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].fn, "REQUESTED_ATTRS");
+    assert.equal(hits[0].allowlisted, true);
+    assert.equal(diffDriverHits(src, [{ ...row, item: false }])[0].allowlisted, false);
+    assert.equal(diffDriverHits(src, [])[0].allowlisted, false);
+  }
+  const src = 'fn REQUESTED_ATTRS() { run(&["diff", "--no-color"]); }';
+  assert.equal(diffDriverHits(src, [row])[0].allowlisted, false);
+  assert.equal(diffDriverHits(src, [{ ...row, item: false }])[0].allowlisted, true);
+});
+
+test("diff drivers fail closed on unreadable literals, groups and verb slots", () => {
+  for (const [src, reason] of [
+    ['fn patch() { let s = "unterminated', /never closes/],
+    ['fn patch() { run(&["diff", "--no-color"', /cannot bound/],
+    ['fn patch() { run(&["diff", "--no-ext-diff"); }', /cannot bound/],
+    ['fn patch() { run(&[x, "diff", "--no-color"]); }', /cannot resolve/],
+  ]) {
+    const hits = diffDriverHits(src);
+    assert.equal(hits.length, 1, src);
+    assert.equal(hits[0].allowlisted, false, src);
+    assert.match(hits[0].fix, reason);
+    assert.equal(hits[0].file, "git/diff.rs");
+    assert.equal(hits[0].line, 1);
+  }
+});
+
 function markerBranchHits(src, other = "", corpus = undefined) {
   const hits = [];
   checkTestMarkerBranches(
@@ -6757,6 +6956,172 @@ test("test modules are skipped by SPAN, so production code after one is scanned"
   );
 });
 
+/** Check J over one fixture file, as [fn, line] pairs. */
+function ghExitAbsenceHits(src, file = "github/fixture.rs", allowlist = []) {
+  const hits = [];
+  checkGhExitAbsence(file, src, src.split("\n"), hits, allowlist);
+  return hits;
+}
+
+test("check J flags each gh-exit-as-absence shape the classifier replaced", () => {
+  // The pre-classifier shapes of security.rs, secrets.rs, auth.rs and pr.rs.
+  const src = [
+    "async fn probe_ok(repo: &str) -> bool {",
+    '    run_gh_raw(Some(repo), &["api", "x"], T)',
+    "        .await",
+    "        .map(|o| o.code == 0)",
+    "        .unwrap_or(false)",
+    "}",
+    "async fn get_bool_field(repo: &str) -> bool {",
+    "    let Ok(out) = run_gh_raw(Some(repo), &[], T).await else { return false; };",
+    "    if out.code != 0 {",
+    "        return false;",
+    "    }",
+    "    true",
+    "}",
+    "pub async fn gh_environments_list(repo: String) -> AppResult<Vec<String>> {",
+    "    let out = run_gh_raw(Some(&repo), &[], T).await?;",
+    "    if out.code != 0 {",
+    "        return Ok(Vec::new());",
+    "    }",
+    "    Ok(vec![])",
+    "}",
+    "pub async fn gh_token_scopes() -> AppResult<GhScopes> {",
+    "    let out = run_gh_raw(None, &[], T).await?;",
+    "    if out.code != 0 {",
+    "        return Ok(GhScopes::default());",
+    "    }",
+    "    Ok(parse(&out))",
+    "}",
+    "pub async fn gh_repo_star_status(repo: String) -> AppResult<bool> {",
+    "    let out = run_gh_raw(Some(&repo), &[], T).await?;",
+    "    Ok(out.code == 0)",
+    "}",
+    "fn trailing(out: GhOutput) -> AppResult<Option<u8>> {",
+    "    if out.code != 0 { Ok(None) } else { Ok(Some(1)) }",
+    "}",
+    "fn defaulted(out: GhOutput) -> Vec<u8> {",
+    "    run(out).map(|x| x.code == 0).unwrap_or_default();",
+    "    if out.code != 0 {",
+    "        return Default::default();",
+    "    }",
+    "    vec![1]",
+    "}",
+  ].join("\n");
+  assert.deepEqual(
+    ghExitAbsenceHits(src).map((h) => [h.fn, h.line]),
+    [
+      ["gh_repo_star_status", 30],
+      ["probe_ok", 4],
+      ["defaulted", 36],
+      ["get_bool_field", 9],
+      ["gh_environments_list", 16],
+      ["gh_token_scopes", 23],
+      ["trailing", 33],
+      ["defaulted", 37],
+    ],
+  );
+  assert.ok(ghExitAbsenceHits(src).every((h) => !h.allowlisted));
+});
+
+test("check J passes classified reads, errors, comments, strings and test modules", () => {
+  const src = [
+    "fn star_outcome(out: GhOutput) -> AppResult<bool> {",
+    "    if out.code != 0 {",
+    "        return match classify_gh_failure(&out.stderr) {",
+    "            GhFailure::NotFound => Ok(false),",
+    "            _ => Err(AppError::Gh(gh_failure_reason(&out))),",
+    "        };",
+    "    }",
+    "    Ok(true)",
+    "}",
+    "fn classified_first(out: GhOutput) -> AppResult<Vec<u8>> {",
+    "    let failure = classify_gh_failure(&out.stderr);",
+    "    if out.code != 0 {",
+    "        return Ok(Vec::new());",
+    "    }",
+    "    Ok(vec![failure as u8])",
+    "}",
+    "fn errs(out: GhOutput) -> AppResult<bool> {",
+    "    if out.code != 0 {",
+    "        return Err(AppError::Gh(gh_failure_reason(&out)));",
+    "    }",
+    "    Ok(out.code == 1)",
+    "}",
+    "// Never `Ok(out.code == 0)` or `if out.code != 0 { return Ok(None); }`.",
+    "fn text() -> &'static str {",
+    '    "if out.code != 0 { return Ok(None); } Ok(out.code == 0)"',
+    "}",
+    "#[cfg(test)]",
+    "mod tests {",
+    "    fn helper(out: GhOutput) -> AppResult<bool> {",
+    "        Ok(out.code == 0)",
+    "    }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(ghExitAbsenceHits(src), []);
+});
+
+test("check J reads only the GitHub files, and allowlists by (file, fn)", () => {
+  const src = [
+    "pub async fn gh_repo_star_status(out: GhOutput) -> AppResult<bool> {",
+    "    Ok(out.code == 0)",
+    "}",
+  ].join("\n");
+  assert.equal(ghExitAbsenceScope("github/pr.rs"), true);
+  assert.equal(ghExitAbsenceScope("forge/github.rs"), true);
+  assert.equal(ghExitAbsenceScope("forge/gitlab.rs"), false);
+  assert.equal(ghExitAbsenceScope("git/ops.rs"), false);
+  assert.deepEqual(ghExitAbsenceHits(src, "forge/gitlab.rs"), []);
+  assert.equal(ghExitAbsenceHits(src, "forge/github.rs").length, 1);
+  const allow = [
+    { file: "github/pr.rs", fn: "gh_repo_star_status", rationale: "fixture" },
+  ];
+  assert.equal(
+    ghExitAbsenceHits(src, "github/pr.rs", allow)[0].allowlisted,
+    true,
+  );
+  // Another file's entry never covers this one.
+  assert.equal(
+    ghExitAbsenceHits(src, "github/auth.rs", allow)[0].allowlisted,
+    false,
+  );
+  // Every live entry carries a rationale.
+  for (const e of GH_EXIT_ABSENCE_ALLOWLIST)
+    assert.ok(e.rationale.length > 20, e.fn);
+});
+
+test("check J fails closed on a file it cannot lex", () => {
+  const src = [
+    "fn fine(out: GhOutput) -> bool {",
+    '    let s = "never closed;',
+    "    if out.code != 0 { return false; }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(
+    ghExitAbsenceHits(src).map((h) => h.fn),
+    ["<unreadable>"],
+  );
+});
+
+test("check J's empty scope lands on J wherever it sits in the list", () => {
+  const j = { run: checkGhExitAbsence, hits: [] };
+  const k = { run: () => {}, hits: [] };
+  // A check added after J must not take J's failure.
+  reportEmptyGhScope([j, k], ["git/ops.rs", "forge/gitlab.rs"]);
+  assert.deepEqual(
+    j.hits.map((h) => h.fn),
+    ["<empty scope>"],
+  );
+  assert.deepEqual(k.hits, []);
+  // A scope with a GitHub file reports nothing.
+  const quiet = { run: checkGhExitAbsence, hits: [] };
+  reportEmptyGhScope([quiet, k], ["github/pr.rs"]);
+  assert.deepEqual(quiet.hits, []);
+  // Losing J from the list fails loudly rather than misrouting.
+  assert.throws(() => reportEmptyGhScope([k], []), /check J is missing/);
+});
+
 // ----------------------------------------------------------- check-dead-surface
 
 test("a commented-out handler entry does not read as registered", () => {
@@ -6842,127 +7207,6 @@ test("invoke matching survives nested generics and wrapped calls", () => {
     "git_branch_tips",
     "git_status",
   ]);
-});
-
-// ----------------------------------------------------------- check-rule-mirrors
-
-// Both fixtures wrap their sentences the way the real carriers do — the `-C`
-// clause and the `is / forbidden` catchall each straddle a line break. That is
-// deliberate: if the whitespace normalization ever came out, the passing
-// fixture would read as a carrier missing two sentinels, so these cases pin the
-// normalization as much as the patterns.
-const carrierStatingTheRule = [
-  "1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /",
-  "   show` and `git branch --list`, each optionally prefixed with `-C <path>`",
-  "   to address a task worktree. Everything else — commit, add/stage, stash,",
-  "   push, worktree, config — is",
-  '   forbidden, even "just to test". The user commits their own work.',
-].join("\n");
-
-test("a carrier that still states the whole rule satisfies every sentinel", () => {
-  assert.deepEqual(missingSentinels(carrierStatingTheRule), []);
-});
-
-test("a carrier that drops the line-wrapped catchall is caught", () => {
-  // The dangerous direction: the whitelist forms are still listed, so the file
-  // LOOKS like it carries the rule — only the sentence forbidding everything
-  // else is gone, which is exactly the drift a reader would not notice.
-  const softened = carrierStatingTheRule.replace(
-    ["   push, worktree, config — is", "   forbidden, even"].join("\n"),
-    "   push, worktree, config — are discouraged, except",
-  );
-  assert.notEqual(softened, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(softened).map((s) => s.name),
-    ["forbidden catchall"],
-  );
-});
-
-test("a carrier that carves an exception into the catchall is caught", () => {
-  // Worse than deleting the sentence, because the sentence is still there to
-  // read: the rule is stated and then unstated in the same breath.
-  const excepted = carrierStatingTheRule.replace(
-    [
-      "   push, worktree, config — is",
-      '   forbidden, even "just to test".',
-    ].join("\n"),
-    "   push, worktree, config — is forbidden, except git commit.",
-  );
-  assert.notEqual(excepted, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(excepted).map((s) => s.name),
-    ["forbidden catchall"],
-  );
-});
-
-test("a carrier that drops the -C sanction is caught", () => {
-  // Losing this clause is what makes a worktree-scoped command read as
-  // forbidden to an agent honoring its own charter.
-  const unscoped = carrierStatingTheRule.replace(
-    [
-      "   show` and `git branch --list`, each optionally prefixed with `-C <path>`",
-      "   to address a task worktree. Everything else",
-    ].join("\n"),
-    "   show` and `git branch --list`. Everything else",
-  );
-  assert.notEqual(unscoped, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(unscoped).map((s) => s.name),
-    ["-C worktree sanction"],
-  );
-});
-
-test("a carrier that drops the branch --list allowance is caught", () => {
-  const withoutBranch = carrierStatingTheRule.replace(
-    "` and `git branch --list`,",
-    "`,",
-  );
-  assert.notEqual(withoutBranch, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(withoutBranch).map((s) => s.name),
-    ["branch --list allowance"],
-  );
-});
-
-test("a carrier that drops the read-only forms list is caught", () => {
-  const withoutForms = carrierStatingTheRule.replace(
-    [
-      "1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /",
-      "   show`",
-    ].join("\n"),
-    "1. **Git is a whitelist.** Permitted: the read-only inspection forms",
-  );
-  assert.notEqual(withoutForms, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(withoutForms).map((s) => s.name),
-    ["read-only git forms"],
-  );
-});
-
-test("every carrier path the gate checks exists on disk", () => {
-  // The sentinels only fire on a file the gate can read: a carrier renamed or
-  // moved without updating CARRIERS would otherwise fail as "cannot read" in
-  // CI long after the rename landed.
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  for (const carrier of CARRIERS) {
-    assert.ok(existsSync(join(root, carrier)), `missing carrier: ${carrier}`);
-  }
-});
-
-test("a mounted carrier, when present, still states the whole rule", () => {
-  // Mounted carriers exist only behind the owner's junction — also the only
-  // place their drift can be authored — so the suite gates them exactly where
-  // it can and skips them in clones, the same split the gate itself makes.
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  for (const carrier of MOUNTED_CARRIERS) {
-    const path = join(root, carrier);
-    if (!existsSync(path)) continue;
-    assert.deepEqual(
-      missingSentinels(readFileSync(path, "utf8")).map((s) => s.name),
-      [],
-      `mounted carrier lost the rule: ${carrier}`,
-    );
-  }
 });
 
 // ------------------------------------------------ check-built-whitespace
@@ -11085,4 +11329,260 @@ test("mcp-secret-keychain-sites: the flush module's extra code violates under ru
   );
   assert.deepEqual(violations, [`${MCP_FLUSH}:42`]);
   assert.deepEqual(stale, []);
+});
+
+// --------------------------------------------- focusable-held-button-render
+
+const focusableHeldRender = scanner("focusable-held-button-render");
+
+test("focusable-held-button-render flags a bare focusable button", () => {
+  const bare = [
+    "<Button",
+    "  disabled={busy}",
+    "  focusableWhenDisabled",
+    "  onClick={go}",
+    ">",
+    "  Load more",
+    "</Button>",
+  ].join("\n");
+  assert.deepEqual(focusableHeldRender(bare), [1]);
+  // The prop's value form is the same attribute.
+  assert.deepEqual(
+    focusableHeldRender("<Button disabled={a} focusableWhenDisabled={!b} />"),
+    [1],
+  );
+});
+
+test("focusable-held-button-render passes the helper's render", () => {
+  assert.deepEqual(
+    focusableHeldRender(
+      [
+        "<Button",
+        "  disabled={busy}",
+        "  focusableWhenDisabled",
+        "  render={heldButtonRender(busy)}",
+        ">",
+        "  Load more",
+        "</Button>",
+      ].join("\n"),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button focusableWhenDisabled={f} render={ heldButtonRender(h, props.render) } />",
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render reads form.SubmitButton as passing through", () => {
+  assert.deepEqual(
+    focusableHeldRender(
+      "<form.SubmitButton focusableWhenDisabled={!!blockedReason}>Save</form.SubmitButton>",
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render ignores the prop in comments and strings", () => {
+  assert.deepEqual(
+    focusableHeldRender(
+      [
+        "// a <Button focusableWhenDisabled> keeps focus",
+        "/* <Button focusableWhenDisabled /> */",
+        'const doc = "<Button focusableWhenDisabled />";',
+        "<div>{/* <Button focusableWhenDisabled /> */}</div>",
+      ].join("\n"),
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render reports a wrapped tag at its opening line", () => {
+  const source = [
+    "const x = 1;",
+    "return (",
+    "  <Button",
+    '    variant="ghost"',
+    '    className={cn("a", ARIA_DISABLED_CLASS)}',
+    "    disabled={fetching}",
+    "    focusableWhenDisabled",
+    "  >",
+    "    More",
+    "  </Button>",
+    ");",
+  ].join("\n");
+  assert.deepEqual(focusableHeldRender(source), [3]);
+});
+
+test("focusable-held-button-render wants the helper as the render itself", () => {
+  // Any other render, or the helper on another attribute, still fails.
+  assert.deepEqual(
+    focusableHeldRender(
+      '<Button focusableWhenDisabled render={<button type="button" />} />',
+    ),
+    [1],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button focusableWhenDisabled data-x={heldButtonRender(a)} />",
+    ),
+    [1],
+  );
+  // A nested tag is judged on its own: the outer one carries no prop.
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Trigger render={<Button disabled focusableWhenDisabled />} />",
+    ),
+    [1],
+  );
+  // A name that merely starts with the prop's is not the prop.
+  assert.deepEqual(
+    focusableHeldRender("<Button focusableWhenDisabledHint={x} />"),
+    [],
+  );
+});
+
+test("focusable-held-button-render leaves the props-object form unreached", () => {
+  // Named in the check's comment: a spread or props object is out of a JSX
+  // rule's reach (ProjectLifecycleDialogs hands its props to form.SubmitButton).
+  assert.deepEqual(
+    focusableHeldRender("<Button {...{ focusableWhenDisabled: true }} />"),
+    [],
+  );
+  // Also named there: whether `held` is right, and a spread after the helper.
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button disabled={b} focusableWhenDisabled render={heldButtonRender(false)} />",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button focusableWhenDisabled render={heldButtonRender(b)} {...rest} />",
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render holds SubmitButton to the helper", () => {
+  const check = CHECKS.find((c) => c.name === "focusable-held-button-render");
+  const file = "src/components/form/submit-button.tsx";
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const real = readFileSync(join(root, file), "utf8");
+  assert.deepEqual(check.scan(view(real), file), []);
+  // NEGATIVE CONTROL: SubmitButton dropping the helper fails its line 1, so
+  // the form.SubmitButton pass can't outlive the pass-through it relies on.
+  const dropped = real.replace(
+    /render=\{heldButtonRender\([\s\S]*?\)\}/,
+    () => "render={props.render}",
+  );
+  assert.notEqual(dropped, real);
+  assert.deepEqual(check.scan(view(dropped), file), [1]);
+  // A call whose first argument never mentions the focusable hold is no
+  // pass-through either.
+  const unheld = real.replace(
+    /heldButtonRender\(\s*Boolean\(held && props\.focusableWhenDisabled\)/,
+    () => "heldButtonRender(false",
+  );
+  assert.notEqual(unheld, real);
+  assert.deepEqual(check.scan(view(unheld), file), [1]);
+  // Nor does the call on another element while the Button renders its own.
+  const moved = dropped.replace(
+    '<Spinner data-icon="inline-start" />',
+    () =>
+      '<Spinner data-icon="inline-start" render={heldButtonRender(Boolean(held && props.focusableWhenDisabled), props.render)} />',
+  );
+  assert.notEqual(moved, dropped);
+  assert.deepEqual(check.scan(view(moved), file), [1]);
+  // A documented limit: the first argument need only mention the prop, so a
+  // short-circuited hold still passes.
+  const shorted = real.replace(
+    /heldButtonRender\(\s*Boolean\(held && props\.focusableWhenDisabled\)/,
+    () => "heldButtonRender(false && props.focusableWhenDisabled",
+  );
+  assert.notEqual(shorted, real);
+  assert.deepEqual(check.scan(view(shorted), file), []);
+});
+
+test("focusable-held-button-render reads a generic tag past its type arguments", () => {
+  assert.deepEqual(
+    focusableHeldRender("<Held<string> disabled focusableWhenDisabled />"),
+    [1],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Held<string> focusableWhenDisabled render={heldButtonRender(h)} />",
+    ),
+    [],
+  );
+  // An arrow's `>` inside the type arguments doesn't close them.
+  assert.deepEqual(
+    focusableHeldRender("<Held<(a: A) => B> focusableWhenDisabled />"),
+    [1],
+  );
+  // A run that never closes fails closed when the prop follows it: ts-mask
+  // refuses it in a .tsx file, and the scan's own walk flags it elsewhere.
+  const unclosed = "<Held<Map<K> disabled focusableWhenDisabled";
+  assert.throws(() => focusableHeldRender(unclosed), /cannot lex/);
+  const check = CHECKS.find((c) => c.name === "focusable-held-button-render");
+  assert.deepEqual(check.scan(view(unclosed), "src/lib/x.ts"), [1]);
+});
+
+test("ts-mask closes a JSX element only at its own closing tag", async () => {
+  const { maskNonCode } = await import("./lib/ts-mask.mjs");
+  // A generic function type lexes as an element named `T`; an unrelated
+  // close tag in a later comment must not end it.
+  for (const src of [
+    'type F = <T>(a: T) => T;\nload(x, {});\n// see the </table> markup\nload("y");',
+    'type Fs = [<T>(a: T) => T];\nload(x, {});\n// see the </table> markup\nload("y");',
+    'const f: <T>(a: T) => T = id;\nload(x, {});\n// see the </table> markup\nload("y");',
+    "const a = <div>x</span>;",
+    "const a = <>x</div>;",
+    "const a = <div>x</>;",
+    "const a = <a.b>x</a>;",
+  ])
+    assert.throws(() => maskNonCode(src, true), /mismatched JSX closing tag/);
+  for (const [src, masked] of [
+    [
+      "const a = <div><span>x</span>y</div>;",
+      "const a = <div><span> </span> </div>;",
+    ],
+    ["const a = <>x{b}</>;", "const a = <> {b}</>;"],
+    ["const a = <a.b>x</a.b>;", "const a = <a.b> </a.b>;"],
+    ["const a = <svg:rect>x</svg:rect>;", "const a = <svg:rect> </svg:rect>;"],
+    ["const a = <br />;", "const a = <br />;"],
+    ["const a = <p>x<br/>y</ p >;", "const a = <p> <br/> </ p >;"],
+  ])
+    assert.equal(maskNonCode(src, true), masked);
+});
+
+test("focusable-held-button-render is clean on the real tree, red without one site's render", () => {
+  const check = CHECKS.find((c) => c.name === "focusable-held-button-render");
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const files = readdirSync(join(root, "src"), { recursive: true })
+    .map((entry) => `src/${String(entry).split("\\").join("/")}`)
+    .filter((file) => /\.tsx?$/.test(file));
+  const views = new Map(
+    files.map((f) => [f, view(readFileSync(join(root, f), "utf8"))]),
+  );
+  const clean = runCheck(check, files, views);
+  assert.deepEqual(clean.violations, []);
+  assert.deepEqual(clean.stale, []);
+  // NEGATIVE CONTROL: one site's render removed in memory turns the tree red.
+  const site = "src/features/actions/ActionsPanel.tsx";
+  const source = readFileSync(join(root, site), "utf8");
+  const line = "render={heldButtonRender(runs.isFetchingNextPage)}";
+  assert.ok(source.includes(line));
+  const mutated = new Map(views).set(
+    site,
+    view(source.replace(line, () => "")),
+  );
+  const red = runCheck(check, files, mutated);
+  assert.equal(red.violations.length, 1);
+  assert.match(
+    red.violations[0],
+    /^src\/features\/actions\/ActionsPanel\.tsx:\d+$/,
+  );
 });

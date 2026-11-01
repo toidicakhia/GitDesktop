@@ -1,8 +1,24 @@
-import { useQuery } from "@tanstack/react-query";
-import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import {
+  type MutationCache,
+  type QueryClient,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useCallback } from "react";
+import {
+  REPO_SHELL_GC_TIME,
+  REPO_SHELL_WARM_STALE_MS,
+} from "@/lib/query-cache-times";
 import { COLD_START_NO_GH } from "@/lib/test-mode";
 import * as api from "../api";
-import { useRepoMutation } from "./internal";
+import { useMutationCacheSnapshot, useRepoMutation } from "./internal";
+import {
+  type PendingPublish,
+  pendingMutationEntries,
+  pendingPublishesFor,
+  publishRepoKey,
+} from "./pr-writes";
+import { recheckRunsAfterPush } from "./push-writes";
 
 export function remotesOptions(repo: string) {
   return {
@@ -11,6 +27,7 @@ export function remotesOptions(repo: string) {
     // Local reads must not park on react-query's default "online" mode offline;
     // the same holds for every `networkMode` in this file.
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
@@ -33,7 +50,10 @@ export function useRemotes(repo: string) {
   });
 }
 
+/** Publishing pushes the repo's commits to the new remote, so it arms the delayed
+ *  run recheck like a push. */
 export function usePublishRepo(repo: string) {
+  const queryClient = useQueryClient();
   return useRepoMutation(
     repo,
     (args: {
@@ -60,8 +80,45 @@ export function usePublishRepo(repo: string) {
       // Pinned: the publish and its repo-subtree invalidation close over `repo`, and
       // the dialog survives a repo switch — without the key the newly-live repo's
       // controls would read the pending publish as busy.
-      identity: ["publish-repo", repo],
+      identity: publishRepoKey(repo),
+      onSuccess: () => recheckRunsAfterPush(queryClient, repo),
     },
+  );
+}
+
+const NO_PENDING_PUBLISHES: PendingPublish[] = [];
+
+/** The publishes of `repo` in flight, read from the mutation cache rather than
+ *  the publish's observer: the identity pin idles the observer at a repo switch,
+ *  and every Publish host (hidden tabs included) must read the same answer. */
+export function usePendingPublishes(repo: string): PendingPublish[] {
+  const select = useCallback(
+    (cache: MutationCache) =>
+      pendingPublishesFor(
+        pendingMutationEntries(
+          cache.findAll({
+            mutationKey: publishRepoKey(repo),
+            status: "pending",
+          }),
+        ),
+        repo,
+      ),
+    [repo],
+  );
+  return useMutationCacheSnapshot(select, NO_PENDING_PUBLISHES);
+}
+
+/** Fire-time twin of {@link usePendingPublishes}: whether `repo` has a publish in
+ *  flight right now, for a submit a stale render could otherwise let through. */
+export function isPublishActive(
+  queryClient: QueryClient,
+  repo: string,
+): boolean {
+  return (
+    queryClient
+      .getMutationCache()
+      .findAll({ mutationKey: publishRepoKey(repo), status: "pending" })
+      .length > 0
   );
 }
 

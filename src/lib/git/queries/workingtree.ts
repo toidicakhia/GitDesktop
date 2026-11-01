@@ -1,7 +1,10 @@
 import { type QueryClient, useQuery } from "@tanstack/react-query";
 import { usePanelActive } from "@/components/panel-portal";
 import { ignoreLines } from "@/lib/ai/ignore";
-import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import {
+  REPO_SHELL_GC_TIME,
+  REPO_SHELL_WARM_STALE_MS,
+} from "@/lib/query-cache-times";
 import { isAppError } from "@/lib/tauri/invoke";
 import * as api from "../api";
 import {
@@ -18,23 +21,19 @@ import { useRepoMutation, workingTreeKeys } from "./internal";
  *  axis follows), so a rule edit invalidates the view whatever settings held. */
 const aiExcludedKey = (repo: string) => ["repo", repo, "ai-excluded"] as const;
 
-/** The families a commit (or amend) makes stale BEYOND the working tree —
- *  history, branch tips/counters, HEAD-rev blobs, and operation state, both
- *  in-flight (a commit can conclude a merge or an interrupted journaled op)
- *  and prospective (merge/conflict previews, local-PR merge states).
- *  Invalidated fire-and-forget so the Commit button never waits on them;
- *  forge-backed keys (pr/issue/CI/…) are deliberately absent — a local
- *  commit cannot change forge state. */
-const commitAftermathKeys = (repo: string) =>
+/** The HEAD-dependent families a commit's aftermath refreshes, minus the four
+ *  the status/log sync already refreshes itself (log, the two unpushed reads,
+ *  op state): history, branch tips/counters, HEAD-rev blobs, and prospective
+ *  operation state (merge/conflict previews, local-PR merge states). Shared by
+ *  a commit's aftermath and StatusLogSync's outside-move refresh; not every
+ *  HEAD-dependent read (StatusLogSync re-reads rewrite-status beside it). */
+export const headMoveAftermathKeys = (repo: string) =>
   [
-    repoKeys.log(repo),
     repoKeys.commits(repo),
     repoKeys.branches(repo),
     ["repo", repo, "log-search"],
     ["repo", repo, "recent-commits"],
     ["repo", repo, "commit-authors"],
-    ["repo", repo, "unpushed-count"],
-    ["repo", repo, "unpushed-messages"],
     ["repo", repo, "branch-stats"],
     ["repo", repo, "stats"],
     ["repo", repo, "divergence"],
@@ -42,7 +41,6 @@ const commitAftermathKeys = (repo: string) =>
     ["repo", repo, "file-log"],
     ["repo", repo, "blame"],
     ["repo", repo, "file-b64", "HEAD"],
-    repoKeys.opState(repo),
     ["repo", repo, "conflict-file"],
     ["repo", repo, "merge-preview"],
     ["repo", repo, "conflict-preview"],
@@ -52,6 +50,21 @@ const commitAftermathKeys = (repo: string) =>
     ["repo", repo, "insights", "commit-activity"],
     ["repo", repo, "insights", "code-frequency"],
     ["repo", repo, "insights", "punch-card"],
+  ] as const;
+
+/** The families a commit (or amend) makes stale BEYOND the working tree: the
+ *  HEAD-move set plus the four the status/log sync owns, since a commit (which
+ *  can conclude a merge or an interrupted journaled op) refreshes them itself.
+ *  Invalidated fire-and-forget so the Commit button never waits on them;
+ *  forge-backed keys (pr/issue/CI/…) are deliberately absent — a local
+ *  commit cannot change forge state. */
+const commitAftermathKeys = (repo: string) =>
+  [
+    repoKeys.log(repo),
+    repoKeys.unpushedCount(repo),
+    repoKeys.unpushedMessages(repo),
+    repoKeys.opState(repo),
+    ...headMoveAftermathKeys(repo),
   ] as const;
 
 export function useFileDiff(
@@ -99,7 +112,11 @@ export function useSessionFileDiff(
     queryKey: [...repoKeys.diff(repo, filePath, false), "session-base", base],
     queryFn: () => api.gitSessionFileDiff(repo, filePath, base),
     enabled: enabled && Boolean(repo && filePath && base),
-    refetchInterval: enabled && live ? 1500 : false,
+    // An errored read stops polling: each poll would flip `isFetching` and
+    // remount the failure notice and its Retry. Retry, invalidation and focus
+    // refetches still resume it, and a success re-arms the poll.
+    refetchInterval: (query) =>
+      enabled && live && query.state.status !== "error" ? 1500 : false,
     refetchIntervalInBackground: false,
     networkMode: "always",
   });
@@ -120,6 +137,7 @@ export function opStateOptions(repo: string) {
     queryKey: repoKeys.opState(repo),
     queryFn: () => api.gitOpState(repo),
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
@@ -159,8 +177,9 @@ const CONFLICT_FILE_RETRY_MS = 300;
  * does. An `io` failure (a read colliding with an editor's save) retries once
  * quickly, since any error swaps the pane to the read-error copy. A failed read
  * also re-runs on the next tick (retry limits only one fetch), so that pane
- * heals without a Retry, except `invalidArgument` (binary or oversized): it
- * can't clear by itself, and each tick would re-read the whole file.
+ * heals without a Retry, except `invalidArgument` (binary, oversized, or refused
+ * by the path gate): it can't clear by itself, and each tick would re-read the
+ * whole file.
  */
 export function useConflictFile(repo: string, path: string) {
   const panelActive = usePanelActive();
@@ -206,12 +225,24 @@ export async function refreshConflictFile(
  *  mounted or shown later holds its buttons through its own first read, so they
  *  never act on pre-write segments; the working tree refreshes behind it. On
  *  error nothing is invalidated: ConflictFileView re-reads itself, and the AI
- *  resolve view renders its own proposal, not the disk. */
+ *  resolve view renders its own proposal, not the disk. A `changedOnDisk`
+ *  outcome is a success here (the awaited re-read runs); the caller shows it. */
 export function useResolveConflict(repo: string) {
   return useRepoMutation(
     repo,
-    (args: { path: string; content: string; stage: boolean }) =>
-      resolveConflict(repo, args.path, args.content, args.stage),
+    (args: {
+      path: string;
+      content: string;
+      stage: boolean;
+      expectedHash: string | null;
+    }) =>
+      resolveConflict(
+        repo,
+        args.path,
+        args.content,
+        args.stage,
+        args.expectedHash,
+      ),
     {
       invalidate: [conflictFileKey(repo)],
       invalidateAfter: workingTreeKeys(repo),
