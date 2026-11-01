@@ -25,6 +25,10 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  /* Frozen destructive fills — see the Edge 109 delta in
+     components/ui/README.md. */
+  --color-destructive-tint: var(--destructive-tint);
+  --color-destructive-tint-hover: var(--destructive-tint-hover);
   /* Semantic state colors — single source of truth for success/warning/info
      and the GitHub-convention "merged" purple. Each has a light+dark value
      baked into the token, so `text-success` etc. need no `dark:` companion.
@@ -85,6 +89,12 @@
   --accent: oklch(0.93 0.035 175);
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
+  /* Destructive-button fills, frozen for the same Edge 109 reason as
+     --secondary-hover: the alpha utilities' color-mix() falls back to the
+     SOLID color there, which paints the red label invisible. 10% fill, 20%
+     hover. */
+  --destructive-tint: oklch(0.577 0.245 27.325 / 10%);
+  --destructive-tint-hover: oklch(0.577 0.245 27.325 / 20%);
   --success: oklch(0.55 0.13 150);
   --warning: oklch(0.62 0.13 65);
   --info: oklch(0.52 0.16 250);
@@ -131,6 +141,8 @@
   --accent: oklch(0.32 0.04 175);
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.704 0.191 22.216);
+  --destructive-tint: oklch(0.704 0.191 22.216 / 20%);
+  --destructive-tint-hover: oklch(0.704 0.191 22.216 / 30%);
   --success: oklch(0.8 0.17 150);
   --warning: oklch(0.83 0.15 75);
   --info: oklch(0.72 0.15 250);
@@ -197,6 +209,8 @@
   --info: oklch(0.72 0.115 250);
   --merged: oklch(0.74 0.125 305);
   --destructive: oklch(0.7 0.155 22);
+  --destructive-tint: oklch(0.7 0.155 22 / 20%);
+  --destructive-tint-hover: oklch(0.7 0.155 22 / 30%);
 }
 
 /* Shiki diff/JSON token colors. The Shiki theme (features/diff/shiki-theme.ts)

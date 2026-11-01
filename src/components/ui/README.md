@@ -146,11 +146,18 @@ entirely.
   utility computed). A token works where the utility didn't because the build
   down-levels custom-property colors, while a `color-mix()` wrapping `var()`s
   survives to the browser untouched.
+- **`button.tsx`** — the `destructive` variant's fills are the
+  `--destructive-tint` / `--destructive-tint-hover` tokens (`src/App.css`, one
+  pair per theme: the same 10%/20% light and 20%/30% dark tint the alpha
+  utilities computed). Those utilities fall back to the SOLID color on Edge
+  109, which painted `text-destructive` red-on-red and left confirmation
+  buttons with no readable label.
 
 Grep the file after regenerating it:
 
 ```sh
 grep -n 'hover:bg-secondary-hover' src/components/ui/button.tsx
+grep -n 'bg-destructive-tint' src/components/ui/button.tsx
 ```
 
 ## Check before re-applying
